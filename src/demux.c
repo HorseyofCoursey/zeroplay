@@ -44,10 +44,11 @@ int demux_open(DemuxContext *ctx, const char *filename,
         ctx->duration_us = ctx->fmt_ctx->duration;   /* AV_TIME_BASE = 1us */
 
     AVStream *vs = ctx->fmt_ctx->streams[ctx->video_stream_idx];
-    fprintf(stderr, "demux: video stream %d — H264 %dx%d @ %d/%d fps\n",
-            ctx->video_stream_idx,
-            vs->codecpar->width, vs->codecpar->height,
-            vs->avg_frame_rate.num, vs->avg_frame_rate.den);
+    fprintf(stderr, "demux: video stream %d — %s %dx%d @ %d/%d fps\n",
+        ctx->video_stream_idx,
+        avcodec_get_name(vs->codecpar->codec_id),
+        vs->codecpar->width, vs->codecpar->height,
+        vs->avg_frame_rate.num, vs->avg_frame_rate.den);
 
     if (ctx->audio_stream_idx >= 0) {
         AVStream *as = ctx->fmt_ctx->streams[ctx->audio_stream_idx];
