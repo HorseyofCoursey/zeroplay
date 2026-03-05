@@ -3,7 +3,7 @@
 
 #include <pthread.h>
 
-#define QUEUE_SIZE 64
+#define QUEUE_SIZE 256
 #define FRAME_QUEUE_SIZE 8   /* decoded frames — keep small to throttle decoder */
 
 typedef struct {
