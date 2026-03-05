@@ -1,3 +1,4 @@
+#include "log.h"
 #include "drm.h"
 
 #include <stdio.h>
@@ -87,7 +88,7 @@ static void calc_dest_rect(uint32_t disp_w, uint32_t disp_h,
         *out_y = 0;
     }
 
-    fprintf(stderr, "drm: dest rect %ux%u+%u+%u (display %ux%u DAR %llu:%llu)\n",
+    vlog("drm: dest rect %ux%u+%u+%u (display %ux%u DAR %llu:%llu)\n",
             *out_w, *out_h, *out_x, *out_y,
             disp_w, disp_h,
             (unsigned long long)dar_w, (unsigned long long)dar_h);
@@ -132,13 +133,13 @@ int drm_open(DrmContext *ctx)
         drmModeFreeResources(res);
         return -1;
     }
-    fprintf(stderr, "drm: connector %u\n", ctx->connector_id);
+    vlog("drm: connector %u\n", ctx->connector_id);
 
     /* Use preferred mode (index 0) */
     drmModeModeInfo mode = connector->modes[0];
     ctx->mode_w = mode.hdisplay;
     ctx->mode_h = mode.vdisplay;
-    fprintf(stderr, "drm: mode %ux%u @ %uHz\n",
+    vlog("drm: mode %ux%u @ %uHz\n",
             ctx->mode_w, ctx->mode_h, mode.vrefresh);
 
     if (drmModeCreatePropertyBlob(ctx->fd, &mode, sizeof(mode),
@@ -198,7 +199,7 @@ int drm_open(DrmContext *ctx)
     if (!ctx->crtc_id || crtc_idx < 0) {
         fprintf(stderr, "drm: no CRTC found\n"); return -1;
     }
-    fprintf(stderr, "drm: crtc %u (index %d)\n", ctx->crtc_id, crtc_idx);
+    vlog("drm: crtc %u (index %d)\n", ctx->crtc_id, crtc_idx);
 
     /* Find NV12-capable plane compatible with our CRTC */
     ctx->plane_id = 0;
@@ -220,7 +221,7 @@ int drm_open(DrmContext *ctx)
         fprintf(stderr, "drm: no NV12 plane for crtc %u\n", ctx->crtc_id);
         return -1;
     }
-    fprintf(stderr, "drm: plane %u\n", ctx->plane_id);
+    vlog("drm: plane %u\n", ctx->plane_id);
 
     /* Look up property IDs */
     ctx->prop_crtc_id = get_property_id(ctx->fd, ctx->connector_id,
@@ -254,7 +255,7 @@ int drm_open(DrmContext *ctx)
         return -1;
     }
 
-    fprintf(stderr, "drm: ready — crtc=%u plane=%u connector=%u\n",
+    vlog("drm: ready — crtc=%u plane=%u connector=%u\n",
             ctx->crtc_id, ctx->plane_id, ctx->connector_id);
     return 0;
 }

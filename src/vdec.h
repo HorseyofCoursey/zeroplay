@@ -9,7 +9,7 @@
 #include "queue.h"
 
 #define VDEC_OUTPUT_BUFS  4
-#define VDEC_CAPTURE_BUFS 4
+#define VDEC_CAPTURE_BUFS 8
 
 typedef struct {
     int         dmabuf_fd;

@@ -14,6 +14,9 @@
 #include "audio.h"
 #include "vdec.h"
 #include "drm.h"
+#include "log.h"
+
+int g_verbose = 0;
 
 /* ------------------------------------------------------------------ */
 /* Globals                                                              */
@@ -74,6 +77,7 @@ static void print_usage(void)
         "  --vol n             initial volume 0-200 (default 100)\n"
         "  --pos n             start position in seconds\n"
         "  --audio-device dev  ALSA device (default: plughw:CARD=vc4hdmi,DEV=0)\n"
+        "  --verbose           print decoder/driver info\n"
         "  --help              show this message\n"
         "\n"
         "controls:\n"
@@ -98,6 +102,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
         { "vol",          required_argument, NULL, 'v' },
         { "pos",          required_argument, NULL, 'p' },
         { "audio-device", required_argument, NULL, 'a' },
+        { "verbose",      no_argument,       NULL, 'V' },
         { "help",         no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
@@ -110,6 +115,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
             case 'v': opt->vol          = atof(optarg);   break;
             case 'p': opt->start_pos    = atof(optarg);   break;
             case 'a': opt->audio_device = optarg;         break;
+            case 'V': g_verbose         = 1;              break;
             case 'h': print_usage(); exit(0);
             default:
                 fprintf(stderr, "unknown option — run with --help\n");
@@ -181,7 +187,11 @@ static int key_poll(void)
 
 static void *demux_thread(void *arg) { (void)arg; demux_run(&demux); return NULL; }
 static void *vdec_thread(void *arg)  { (void)arg; vdec_run(&vdec);   return NULL; }
-static void *audio_thread(void *arg) { (void)arg; audio_run(&audio); return NULL; }
+static void *audio_thread(void *arg) {
+    (void)arg;
+    audio_run(&audio);
+    return NULL;
+}
 
 static int  g_no_audio = 0;
 
@@ -246,7 +256,7 @@ static void do_seek(int64_t *wall_start, int *frame_count,
 
     queue_init(&video_queue);
     queue_init(&audio_queue);
-    queue_init(&frame_queue);
+    queue_init_size(&frame_queue, FRAME_QUEUE_SIZE);
 
     demux.video_queue = &video_queue;
     demux.audio_queue = &audio_queue;
@@ -278,7 +288,7 @@ static void do_loop(int64_t *wall_start, int *frame_count,
 
     queue_init(&video_queue);
     queue_init(&audio_queue);
-    queue_init(&frame_queue);
+    queue_init_size(&frame_queue, FRAME_QUEUE_SIZE);
 
     demux.video_queue = &video_queue;
     demux.audio_queue = &audio_queue;
@@ -304,7 +314,7 @@ int main(int argc, char *argv[])
 
     queue_init(&video_queue);
     queue_init(&audio_queue);
-    queue_init(&frame_queue);
+    queue_init_size(&frame_queue, FRAME_QUEUE_SIZE);
 
     if (demux_open(&demux, opt.filename, &video_queue, &audio_queue) < 0)
         return 1;
@@ -348,6 +358,13 @@ int main(int argc, char *argv[])
     }
 
     threads_start();
+
+    /* Raise main thread to realtime so the display loop isn't starved
+     * by audio decode on the Pi Zero 2W's limited CPU budget. */
+    {
+        struct sched_param sp = { .sched_priority = 10 };
+        pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+    }
 
     int          frame_count = 0;
     int64_t      wall_start  = 0;
@@ -439,8 +456,14 @@ int main(int argc, char *argv[])
             frame      = held_frame;
             held_frame = NULL;
         } else {
-            if (!queue_pop(&frame_queue, &item)) {
-                /* End of stream */
+            int rc = queue_trypop(&frame_queue, &item);
+            if (rc == 0) {
+                /* No frame ready yet — yield and re-poll keys next iteration */
+                sleep_us(2000);
+                continue;
+            }
+            if (rc < 0) {
+                /* Queue closed — end of stream */
                 if (opt.loop) {
                     do_loop(&wall_start, &frame_count, &prev_frame, &held_frame);
                     continue;
@@ -473,6 +496,24 @@ int main(int argc, char *argv[])
                 if (!g_no_audio) audio_pause(&audio);
                 fprintf(stderr, "zeroplay: paused at %.1fs\n", current_pts / 1e6);
                 break;
+            }
+            if (key == '+' || key == '=') {
+                if (!g_no_audio) {
+                    float v = audio_volume_up(&audio);
+                    fprintf(stderr, "zeroplay: volume %.0f%%\n", v * 100.0f);
+                }
+            }
+            if (key == '-' || key == '_') {
+                if (!g_no_audio) {
+                    float v = audio_volume_down(&audio);
+                    fprintf(stderr, "zeroplay: volume %.0f%%\n", v * 100.0f);
+                }
+            }
+            if (key == 'm' || key == 'M') {
+                if (!g_no_audio) {
+                    int muted = audio_toggle_mute(&audio);
+                    fprintf(stderr, "zeroplay: %s\n", muted ? "muted" : "unmuted");
+                }
             }
             if (key == KEY_RIGHT || key == KEY_LEFT ||
                 key == KEY_UP    || key == KEY_DOWN) {

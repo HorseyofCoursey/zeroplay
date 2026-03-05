@@ -1,3 +1,4 @@
+#include "log.h"
 #include "audio.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -94,7 +95,7 @@ int audio_open(AudioContext *ctx, AVStream *stream,
         return -1;
     }
 
-    fprintf(stderr, "audio: decoder opened — %s %d Hz %d ch\n",
+    vlog("audio: decoder opened — %s %d Hz %d ch\n",
             codec->name, ctx->sample_rate, ctx->channels);
 
     /* ------------------------------------------------------------------ */
@@ -164,7 +165,7 @@ int audio_open(AudioContext *ctx, AVStream *stream,
     snd_pcm_sw_params_set_start_threshold(ctx->pcm, sw_params, period_size);
     snd_pcm_sw_params(ctx->pcm, sw_params);
 
-    fprintf(stderr, "audio: ALSA opened — device=%s rate=%u\n",
+    vlog("audio: ALSA opened — device=%s rate=%u\n",
             ctx->device, rate);
 
     return 0;

@@ -5,15 +5,23 @@
 void queue_init(Queue *q)
 {
     memset(q, 0, sizeof(*q));
+    q->max = QUEUE_SIZE;
     pthread_mutex_init(&q->mutex, NULL);
     pthread_cond_init(&q->not_empty, NULL);
     pthread_cond_init(&q->not_full, NULL);
 }
 
+void queue_init_size(Queue *q, int max)
+{
+    queue_init(q);
+    if (max > 0 && max <= QUEUE_SIZE)
+        q->max = max;
+}
+
 int queue_push(Queue *q, void *item)
 {
     pthread_mutex_lock(&q->mutex);
-    while (q->count == QUEUE_SIZE && !q->closed)
+    while (q->count == q->max && !q->closed)
         pthread_cond_wait(&q->not_full, &q->mutex);
 
     if (q->closed) {
@@ -41,6 +49,22 @@ int queue_pop(Queue *q, void **item)
         return 0;
     }
 
+    *item = q->items[q->head];
+    q->head = (q->head + 1) % QUEUE_SIZE;
+    q->count--;
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->mutex);
+    return 1;
+}
+
+int queue_trypop(Queue *q, void **item)
+{
+    pthread_mutex_lock(&q->mutex);
+    if (q->count == 0) {
+        int closed = q->closed;
+        pthread_mutex_unlock(&q->mutex);
+        return closed ? -1 : 0;  /* -1 = closed+empty, 0 = just empty */
+    }
     *item = q->items[q->head];
     q->head = (q->head + 1) % QUEUE_SIZE;
     q->count--;

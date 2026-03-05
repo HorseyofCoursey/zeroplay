@@ -1,3 +1,4 @@
+#include "log.h"
 #include "vdec.h"
 
 #include <stdio.h>
@@ -9,6 +10,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <poll.h>
+#include <time.h>
 #include <libavutil/avutil.h>
 #include <libavutil/mathematics.h>
 
@@ -43,7 +45,7 @@ static int set_output_format(VdecContext *ctx)
         return -1;
     }
     ctx->out_buf_size = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
-    fprintf(stderr, "vdec: output format set — %.4s %ux%u, buf_size=%u\n",
+    vlog("vdec: output format set — %.4s %ux%u, buf_size=%u\n",
             (char*)&ctx->v4l2_pixfmt,
             ctx->stream_width, ctx->stream_height, ctx->out_buf_size);
     return 0;
@@ -88,7 +90,7 @@ static int alloc_output_buffers(VdecContext *ctx)
         }
     }
 
-    fprintf(stderr, "vdec: %d output buffers allocated\n", VDEC_OUTPUT_BUFS);
+    vlog("vdec: %d output buffers allocated\n", VDEC_OUTPUT_BUFS);
     return 0;
 }
 
@@ -115,10 +117,13 @@ static int handle_source_change(VdecContext *ctx)
     uint32_t w = fmt.fmt.pix_mp.width;
     uint32_t h = fmt.fmt.pix_mp.height;
 
-    if (w <= 32 || h <= 32)
-        return 0;
-
-    if (ctx->fmt_negotiated)
+    /* Some files cause a spurious SOURCE_CHANGE with zero/tiny dimensions
+     * before the real one. Fall back to the declared stream dimensions. */
+    if (w <= 32 || h <= 32) {
+        w = ctx->stream_width;
+        h = ctx->stream_height;
+    }
+    if (w == 0 || h == 0)
         return 0;
 
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -219,8 +224,11 @@ static int handle_source_change(VdecContext *ctx)
 static int feed_packet(VdecContext *ctx, int buf_idx, AVPacket *pkt)
 {
     uint32_t copy_size = (uint32_t)pkt->size;
-    if (copy_size > ctx->out_buf_size)
+    if (copy_size > ctx->out_buf_size) {
+        fprintf(stderr, "vdec: packet truncated %u -> %u bytes — increase output buffer\n",
+                copy_size, ctx->out_buf_size);
         copy_size = ctx->out_buf_size;
+    }
     memcpy(ctx->out_mem[buf_idx], pkt->data, copy_size);
 
     int64_t pts_us = 0;
@@ -239,6 +247,8 @@ static int feed_packet(VdecContext *ctx, int buf_idx, AVPacket *pkt)
     buf.m.planes          = &plane;
     buf.length            = 1;
     buf.field             = V4L2_FIELD_NONE;
+    if (pkt->flags & AV_PKT_FLAG_KEY)
+        buf.flags |= V4L2_BUF_FLAG_KEYFRAME;
     buf.timestamp.tv_sec  = (long)(pts_us / 1000000LL);
     buf.timestamp.tv_usec = (long)(pts_us % 1000000LL);
     plane.bytesused       = copy_size;
@@ -285,7 +295,8 @@ int vdec_open(VdecContext *ctx, AVStream *stream,
         case AV_CODEC_ID_H264:
             v4l2_fmt = V4L2_PIX_FMT_H264;
             /* MP4/MOV wrap H264 in AVCC format — needs BSF to convert to
-             * Annex B. MKV already stores Annex B, detect by extradata. */
+             * Annex B. Detect by extradata: AVCC starts with 0x01,
+             * Annex B starts with 0x00. */
             if (stream->codecpar->extradata_size > 0 &&
                 stream->codecpar->extradata[0] != 0x00)
                 bsf_name = "h264_mp4toannexb";
@@ -301,9 +312,6 @@ int vdec_open(VdecContext *ctx, AVStream *stream,
             break;
         case AV_CODEC_ID_VP9:
             v4l2_fmt = V4L2_PIX_FMT_VP9;
-            break;
-        case AV_CODEC_ID_MPEG4:
-            v4l2_fmt = V4L2_PIX_FMT_MPEG4;
             break;
         default:
             fprintf(stderr, "vdec: unsupported codec %s\n",
@@ -348,7 +356,7 @@ int vdec_open(VdecContext *ctx, AVStream *stream,
         fprintf(stderr, "vdec: FATAL — not M2M multiplanar\n");
         return -1;
     }
-    fprintf(stderr, "vdec: opened %s (%s)\n", cap.card, cap.driver);
+    vlog("vdec: opened %s (%s)\n", cap.card, cap.driver);
 
     struct v4l2_event_subscription sub;
     memset(&sub, 0, sizeof(sub));
@@ -366,7 +374,70 @@ int vdec_open(VdecContext *ctx, AVStream *stream,
         perror("vdec: VIDIOC_STREAMON OUTPUT");
         return -1;
     }
-    fprintf(stderr, "vdec: output streaming started — waiting for SPS\n");
+
+    /* Pre-allocate capture buffers at the declared stream resolution and
+     * start capture streaming. ffmpeg does this before feeding any packets.
+     * The bcm2835 driver needs capture buffers queued before it will start
+     * parsing the bitstream and emitting SOURCE_CHANGE. When SOURCE_CHANGE
+     * fires we reinitialise at the correct decoded resolution. */
+    {
+        struct v4l2_format cap_fmt;
+        memset(&cap_fmt, 0, sizeof(cap_fmt));
+        cap_fmt.type                   = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        cap_fmt.fmt.pix_mp.width       = ctx->stream_width;
+        cap_fmt.fmt.pix_mp.height      = ctx->stream_height;
+        cap_fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+        cap_fmt.fmt.pix_mp.field       = V4L2_FIELD_NONE;
+        cap_fmt.fmt.pix_mp.num_planes  = 1;
+        xioctl(ctx->fd, VIDIOC_S_FMT, &cap_fmt);
+
+        ctx->width        = cap_fmt.fmt.pix_mp.width;
+        ctx->height       = cap_fmt.fmt.pix_mp.height;
+        ctx->cap_buf_size = cap_fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+
+        struct v4l2_requestbuffers req;
+        memset(&req, 0, sizeof(req));
+        req.count  = VDEC_CAPTURE_BUFS;
+        req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        req.memory = V4L2_MEMORY_MMAP;
+        xioctl(ctx->fd, VIDIOC_REQBUFS, &req);
+
+        /* Export and queue all capture buffers */
+        for (int i = 0; i < VDEC_CAPTURE_BUFS; i++) {
+            struct v4l2_buffer buf;
+            struct v4l2_plane  plane;
+            memset(&buf,   0, sizeof(buf));
+            memset(&plane, 0, sizeof(plane));
+            buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            buf.memory   = V4L2_MEMORY_MMAP;
+            buf.index    = (uint32_t)i;
+            buf.m.planes = &plane;
+            buf.length   = 1;
+            if (xioctl(ctx->fd, VIDIOC_QUERYBUF, &buf) < 0) continue;
+
+            struct v4l2_exportbuffer expbuf;
+            memset(&expbuf, 0, sizeof(expbuf));
+            expbuf.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            expbuf.index = (uint32_t)i;
+            expbuf.plane = 0;
+            expbuf.flags = O_RDONLY;
+            if (xioctl(ctx->fd, VIDIOC_EXPBUF, &expbuf) < 0) continue;
+            ctx->cap_dmabuf_fd[i] = expbuf.fd;
+
+            memset(&plane, 0, sizeof(plane));
+            buf.m.planes = &plane;
+            xioctl(ctx->fd, VIDIOC_QBUF, &buf);
+        }
+
+        enum v4l2_buf_type cap_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        if (xioctl(ctx->fd, VIDIOC_STREAMON, &cap_type) < 0) {
+            perror("vdec: VIDIOC_STREAMON CAPTURE (pre-alloc)");
+        } else {
+            ctx->fmt_negotiated = 1;
+        }
+    }
+
+    vlog("vdec: output streaming started — waiting for SPS\n");
     return 0;
 }
 
@@ -380,6 +451,8 @@ void vdec_run(VdecContext *ctx)
 
     int eos       = 0;
     int eos_polls = 0;
+    int sps_timing = 0;
+    struct timespec sps_start = {0};
 
     struct pollfd pfd;
     pfd.fd     = ctx->fd;
@@ -415,7 +488,6 @@ void vdec_run(VdecContext *ctx)
                 AVPacket *raw_pkt = (AVPacket *)item;
 
                 if (ctx->bsf) {
-                    /* Codec needs Annex B conversion (e.g. H264/HEVC from MP4) */
                     if (av_bsf_send_packet(ctx->bsf, raw_pkt) < 0) {
                         av_packet_free(&raw_pkt);
                         continue;
@@ -435,7 +507,6 @@ void vdec_run(VdecContext *ctx)
                     av_packet_free(&out_pkt);
                     if (err < 0) out_buf_free[i] = 1;
                 } else {
-                    /* Packet is already in the right format (e.g. MKV H264) */
                     out_buf_free[i] = 0;
                     int err = feed_packet(ctx, i, raw_pkt);
                     av_packet_free(&raw_pkt);
@@ -458,6 +529,7 @@ void vdec_run(VdecContext *ctx)
             memset(&evt, 0, sizeof(evt));
             if (xioctl(ctx->fd, VIDIOC_DQEVENT, &evt) == 0) {
                 if (evt.type == V4L2_EVENT_SOURCE_CHANGE) {
+                    sps_timing = 0;
                     if (handle_source_change(ctx) < 0) {
                         fprintf(stderr, "vdec: source change failed\n");
                         break;
@@ -505,6 +577,22 @@ void vdec_run(VdecContext *ctx)
 
         if (eos) {
             if (++eos_polls > 20) break;
+        }
+
+        /* If SOURCE_CHANGE never arrives after 10 real seconds, the
+         * hardware can't decode this stream — bail out cleanly. */
+        if (!ctx->fmt_negotiated) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (!sps_timing) {
+                sps_start  = now;
+                sps_timing = 1;
+            } else if ((now.tv_sec - sps_start.tv_sec) >= 10) {
+                fprintf(stderr, "vdec: hardware decoder timed out — unsupported codec or profile\n");
+                break;
+            }
+        } else {
+            sps_timing = 0;
         }
     }
 

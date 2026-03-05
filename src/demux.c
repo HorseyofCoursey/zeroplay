@@ -1,3 +1,4 @@
+#include "log.h"
 #include "demux.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,15 +45,15 @@ int demux_open(DemuxContext *ctx, const char *filename,
         ctx->duration_us = ctx->fmt_ctx->duration;   /* AV_TIME_BASE = 1us */
 
     AVStream *vs = ctx->fmt_ctx->streams[ctx->video_stream_idx];
-    fprintf(stderr, "demux: video stream %d — %s %dx%d @ %d/%d fps\n",
-        ctx->video_stream_idx,
-        avcodec_get_name(vs->codecpar->codec_id),
-        vs->codecpar->width, vs->codecpar->height,
-        vs->avg_frame_rate.num, vs->avg_frame_rate.den);
+    vlog("demux: video stream %d — %s %dx%d @ %d/%d fps\n",
+            ctx->video_stream_idx,
+            avcodec_get_name(vs->codecpar->codec_id),
+            vs->codecpar->width, vs->codecpar->height,
+            vs->avg_frame_rate.num, vs->avg_frame_rate.den);
 
     if (ctx->audio_stream_idx >= 0) {
         AVStream *as = ctx->fmt_ctx->streams[ctx->audio_stream_idx];
-        fprintf(stderr, "demux: audio stream %d — %d Hz %d ch\n",
+        vlog("demux: audio stream %d — %d Hz %d ch\n",
                 ctx->audio_stream_idx,
                 as->codecpar->sample_rate,
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100)
@@ -63,7 +64,7 @@ int demux_open(DemuxContext *ctx, const char *filename,
                 );
     }
 
-    fprintf(stderr, "demux: duration %.1f s\n", ctx->duration_us / 1e6);
+    vlog("demux: duration %.1f s\n", ctx->duration_us / 1e6);
     return 0;
 }
 
@@ -149,13 +150,13 @@ int demux_next_chapter(DemuxContext *ctx, int64_t current_us,
         /* Find first chapter that starts strictly after current position */
         if (start > current_us + 1000000LL) {   /* 1s tolerance */
             *target_us = start;
-            fprintf(stderr, "demux: next chapter %u/%u at %.1fs\n",
+            vlog("demux: next chapter %u/%u at %.1fs\n",
                     i + 1, n, start / 1e6);
             return 0;
         }
     }
 
-    fprintf(stderr, "demux: already at last chapter\n");
+    vlog("demux: already at last chapter\n");
     return -1;
 }
 
@@ -183,12 +184,12 @@ int demux_prev_chapter(DemuxContext *ctx, int64_t current_us,
     if (best < 0) {
         /* Already at or before first chapter — go to start */
         *target_us = 0;
-        fprintf(stderr, "demux: before first chapter, seeking to start\n");
+        vlog("demux: before first chapter, seeking to start\n");
         return 0;
     }
 
     *target_us = best;
-    fprintf(stderr, "demux: prev chapter %u/%u at %.1fs\n",
+    vlog("demux: prev chapter %u/%u at %.1fs\n",
             best_idx + 1, n, best / 1e6);
     return 0;
 }
