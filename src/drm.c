@@ -102,9 +102,28 @@ int drm_open(DrmContext *ctx)
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->first_frame = 1;
+    ctx->fd = -1;
 
-    ctx->fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
-    if (ctx->fd < 0) { perror("drm: open"); return -1; }
+    drmDevicePtr devices[4];
+    const int device_max = sizeof(devices) / sizeof(devices[0]);
+
+    const int device_count = drmGetDevices2(0, devices, device_max);
+
+    for (int i = 0; i < device_count; i++) {
+        const drmDevicePtr device_ptr = devices[i];
+
+        if ((device_ptr->available_nodes & (1 << DRM_NODE_PRIMARY)) == 0)
+        {
+            continue;
+        }
+
+        ctx->fd = open(device_ptr->nodes[DRM_NODE_PRIMARY], O_RDWR | O_CLOEXEC);
+        if (ctx->fd < 0) {perror("drm: open"); continue; }
+
+        break;
+    }
+
+    if (ctx->fd < 0) { fprintf(stderr, "drm: no suitable card fount\n"); return -1; }
 
     if (drmSetClientCap(ctx->fd, DRM_CLIENT_CAP_ATOMIC, 1) < 0) {
         fprintf(stderr, "drm: no atomic\n"); return -1;
