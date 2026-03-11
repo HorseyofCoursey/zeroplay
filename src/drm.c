@@ -176,6 +176,8 @@ static int setup_output(int fd, drmModeRes *res,
     vlog("drm: connector %u -> crtc %u (idx %d)\n",
             out->connector_id, out->crtc_id, crtc_idx);
 
+    out->prev_mode = drmModeGetCrtc(fd, crtc_id);
+
     /* Primary NV12-capable plane for this CRTC.
      * Per 6by9 (RPi engineer): primary plane is always the lowest-numbered
      * plane for a given CRTC, one guaranteed per CRTC. */
@@ -432,6 +434,15 @@ void drm_close(DrmContext *ctx)
             drmModeDestroyPropertyBlob(ctx->fd, out->mode_blob_id);
             out->mode_blob_id = 0;
         }
+        drmModeSetCrtc(ctx->fd,
+                       out->prev_mode->crtc_id,
+                       out->prev_mode->buffer_id,
+                       out->prev_mode->x,
+                       out->prev_mode->y,
+                       &out->connector_id,
+                       1,
+                       &out->prev_mode->mode);
+        drmModeFreeCrtc(out->prev_mode);
     }
     if (ctx->fd >= 0) {
         close(ctx->fd);

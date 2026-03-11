@@ -12,6 +12,8 @@ typedef struct {
     uint32_t crtc_id;
     uint32_t plane_id;
 
+    drmModeCrtcPtr prev_mode;
+
     /* DRM property IDs */
     uint32_t prop_crtc_id;
     uint32_t prop_active;
