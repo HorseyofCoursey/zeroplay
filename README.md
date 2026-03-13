@@ -12,9 +12,10 @@ have a nice day ;)
 | Pi Zero 2 W | Raspberry Pi OS Lite 64-bit (Trixie) |
 | Pi Zero 2 W | Raspberry Pi OS Lite 32-bit (Trixie) |
 | Pi 3 / 3+ | Raspberry Pi OS Lite 64-bit (Trixie) |
+| Pi 3 / 3+ | Raspberry Pi OS Lite 32-bit (Trixie) |
 | Pi 4 | Raspberry Pi OS Lite 64-bit (Trixie) |
 
-Both 32-bit and 64-bit builds are supported. The install script builds from source automatically for the correct architecture. 32 bit testing has been done only on Pi Zero and Pi Zero 2 but likely works Pi 3 and Pi 4. 
+Both 32-bit and 64-bit builds are supported. The install script builds from source automatically for the correct architecture. 32 bit testing has been done only on Pi Zero, Pi Zero 2, and Pi 3 but likely works on Pi 4. 
 
 ## Supported Formats
 | Codec | Container |
