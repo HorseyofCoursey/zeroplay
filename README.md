@@ -189,20 +189,6 @@ Make sure your user is in the `video` group:
 sudo usermod -aG video pi
 ```
 
-## Multi-Pi sync
-
-ZeroPlay supports synchronised playback across multiple Pis over a local network. Each Pi plays its own local copy of the file independently, with one Pi acting as master clock.
-
-```
-# Master Pi
-zeroplay --sync-master --loop movie.mp4
-
-# Slave Pi(s)
-zeroplay --sync-slave 192.168.1.100 --loop movie.mp4
-```
-
-Start the master first, then the slaves. Sync accuracy is typically within 20ms on a local network.
-
 ## How It Works
 * **Demux** — libavformat reads the container and routes packets
 * **Video decode** — V4L2 M2M hardware decoder via bcm2835-codec
