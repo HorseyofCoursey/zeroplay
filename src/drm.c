@@ -7,8 +7,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/mman.h>
 #include <sys/select.h>
 #include <drm/drm_fourcc.h>
+#include <drm/drm_mode.h>
 
 /* ------------------------------------------------------------------ */
 /* Internal helpers                                                     */
@@ -50,7 +52,6 @@ static int plane_supports_nv12(int fd, uint32_t plane_id)
 
 /*
  * Compute letterbox/pillarbox destination rectangle.
- *
  * Fits the video's display aspect ratio into the display,
  * centering with black bars as needed.
  */
@@ -136,9 +137,81 @@ static int find_crtc(int fd, drmModeRes *res, drmModeConnector *connector,
     return -1;
 }
 
+/* Release a GEM handle — method depends on whether it's a dumb buffer */
+static void release_gem(int fd, uint32_t gem_handle, int is_dumb)
+{
+    if (!gem_handle) return;
+    if (is_dumb) {
+        struct drm_mode_destroy_dumb dreq = { .handle = gem_handle };
+        drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+    } else {
+        drmCloseBufferHandle(fd, gem_handle);
+    }
+}
+
+/* Release previous framebuffer and GEM handle for an output */
+static void release_prev(int fd, DrmOutput *out)
+{
+    if (out->prev_fb_id) {
+        drmModeRmFB(fd, out->prev_fb_id);
+        out->prev_fb_id = 0;
+    }
+    if (out->prev_gem_handle) {
+        release_gem(fd, out->prev_gem_handle, out->prev_is_dumb);
+        out->prev_gem_handle = 0;
+        out->prev_is_dumb    = 0;
+    }
+}
+
+/*
+ * Perform an atomic commit.
+ * need_modeset=1 adds ACTIVE/MODE_ID/CRTC_ID properties and sets
+ * DRM_MODE_ATOMIC_ALLOW_MODESET.
+ */
+static int do_atomic_commit(int fd, DrmOutput *out,
+                             uint32_t fb_id,
+                             uint32_t src_w, uint32_t src_h,
+                             int need_modeset)
+{
+    drmModeAtomicReq *areq = drmModeAtomicAlloc();
+    if (!areq) return -1;
+
+    if (need_modeset) {
+        drmModeAtomicAddProperty(areq, out->crtc_id,
+                                 out->prop_active,  1);
+        drmModeAtomicAddProperty(areq, out->crtc_id,
+                                 out->prop_mode_id, out->mode_blob_id);
+        drmModeAtomicAddProperty(areq, out->connector_id,
+                                 out->prop_crtc_id, out->crtc_id);
+    }
+
+    drmModeAtomicAddProperty(areq, out->plane_id, out->prop_src_x, 0);
+    drmModeAtomicAddProperty(areq, out->plane_id, out->prop_src_y, 0);
+    drmModeAtomicAddProperty(areq, out->plane_id,
+                             out->prop_src_w, (uint64_t)src_w << 16);
+    drmModeAtomicAddProperty(areq, out->plane_id,
+                             out->prop_src_h, (uint64_t)src_h << 16);
+    drmModeAtomicAddProperty(areq, out->plane_id,
+                             out->prop_crtc_x, out->dest_x);
+    drmModeAtomicAddProperty(areq, out->plane_id,
+                             out->prop_crtc_y, out->dest_y);
+    drmModeAtomicAddProperty(areq, out->plane_id,
+                             out->prop_crtc_w, out->dest_w);
+    drmModeAtomicAddProperty(areq, out->plane_id,
+                             out->prop_crtc_h, out->dest_h);
+    drmModeAtomicAddProperty(areq, out->plane_id,
+                             out->prop_fb_id,   fb_id);
+    drmModeAtomicAddProperty(areq, out->plane_id,
+                             out->prop_crtc_id, out->crtc_id);
+
+    uint32_t flags = need_modeset ? DRM_MODE_ATOMIC_ALLOW_MODESET : 0;
+    int ret = drmModeAtomicCommit(fd, areq, flags, NULL);
+    drmModeAtomicFree(areq);
+    return ret;
+}
+
 /*
  * Set up one DrmOutput for a connected connector.
- * claimed_crtcs is updated to mark the newly claimed CRTC.
  */
 static int setup_output(int fd, drmModeRes *res,
                         drmModeConnector *connector,
@@ -173,10 +246,12 @@ static int setup_output(int fd, drmModeRes *res,
     }
     out->crtc_id = crtc_id;
     *claimed_crtcs |= (1u << crtc_idx);
+
+    /* Save current CRTC state for restore on exit */
+    out->prev_crtc = drmModeGetCrtc(fd, crtc_id);
+
     vlog("drm: connector %u -> crtc %u (idx %d)\n",
             out->connector_id, out->crtc_id, crtc_idx);
-
-    out->prev_mode = drmModeGetCrtc(fd, crtc_id);
 
     /* Primary NV12-capable plane for this CRTC.
      * Per 6by9 (RPi engineer): primary plane is always the lowest-numbered
@@ -202,7 +277,6 @@ static int setup_output(int fd, drmModeRes *res,
         drmModeDestroyPropertyBlob(fd, out->mode_blob_id);
         return -1;
     }
-    vlog("drm: connector %u plane %u\n", out->connector_id, out->plane_id);
 
     out->prop_crtc_id = get_property_id(fd, out->connector_id,
                                          DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
@@ -251,9 +325,8 @@ int drm_open(DrmContext *ctx)
     memset(ctx, 0, sizeof(*ctx));
     ctx->fd = -1;
 
-    /* Enumerate DRM devices, open the first with a primary node */
     drmDevicePtr devices[4];
-    const int device_max = sizeof(devices) / sizeof(devices[0]);
+    const int device_max   = sizeof(devices) / sizeof(devices[0]);
     const int device_count = drmGetDevices2(0, devices, device_max);
     for (int i = 0; i < device_count; i++) {
         if (!(devices[i]->available_nodes & (1 << DRM_NODE_PRIMARY)))
@@ -278,7 +351,6 @@ int drm_open(DrmContext *ctx)
     drmModeRes *res = drmModeGetResources(ctx->fd);
     if (!res) { fprintf(stderr, "drm: no resources\n"); return -1; }
 
-    /* Set up one output per connected connector */
     uint32_t claimed_crtcs = 0;
     for (int i = 0; i < res->count_connectors &&
                     ctx->output_count < DRM_MAX_OUTPUTS; i++) {
@@ -323,8 +395,8 @@ int drm_present(DrmContext *ctx, int output_idx, DecodedFrame *frame)
         return -1;
     }
 
-    uint32_t stride  = frame->stride;
-    uint32_t y_size  = stride * frame->height;
+    uint32_t stride = frame->stride;
+    uint32_t y_size = stride * frame->height;
 
     uint32_t handles[4]   = { gem_handle, gem_handle, 0, 0 };
     uint32_t pitches[4]   = { stride,     stride,     0, 0 };
@@ -344,55 +416,25 @@ int drm_present(DrmContext *ctx, int output_idx, DecodedFrame *frame)
         return -1;
     }
 
-    if (out->first_frame) {
+    /* Recalculate dest rect on first frame or when video dimensions change */
+    if (out->first_frame ||
+        frame->width      != out->vid_w ||
+        frame->src_height != out->vid_h) {
         calc_dest_rect(out->mode_w, out->mode_h,
                        frame->width, frame->src_height,
                        frame->sar_num, frame->sar_den,
                        &out->dest_x, &out->dest_y,
                        &out->dest_w, &out->dest_h);
+        out->vid_w = frame->width;
+        out->vid_h = frame->src_height;
     }
 
-    drmModeAtomicReq *areq = drmModeAtomicAlloc();
-    if (!areq) {
-        drmModeRmFB(ctx->fd, fb_id);
-        drmCloseBufferHandle(ctx->fd, gem_handle);
-        return -1;
-    }
+    /* Need modeset if first frame or switching from image (XRGB) to video (NV12) */
+    int need_modeset = out->first_frame ||
+                       (out->current_format != DRM_FORMAT_NV12);
 
-    if (out->first_frame) {
-        drmModeAtomicAddProperty(areq, out->crtc_id,
-                                 out->prop_active,  1);
-        drmModeAtomicAddProperty(areq, out->crtc_id,
-                                 out->prop_mode_id, out->mode_blob_id);
-        drmModeAtomicAddProperty(areq, out->connector_id,
-                                 out->prop_crtc_id, out->crtc_id);
-    }
-
-    drmModeAtomicAddProperty(areq, out->plane_id, out->prop_src_x, 0);
-    drmModeAtomicAddProperty(areq, out->plane_id, out->prop_src_y, 0);
-    drmModeAtomicAddProperty(areq, out->plane_id,
-                             out->prop_src_w, (uint64_t)frame->width      << 16);
-    drmModeAtomicAddProperty(areq, out->plane_id,
-                             out->prop_src_h, (uint64_t)frame->src_height << 16);
-
-    drmModeAtomicAddProperty(areq, out->plane_id,
-                             out->prop_crtc_x, out->dest_x);
-    drmModeAtomicAddProperty(areq, out->plane_id,
-                             out->prop_crtc_y, out->dest_y);
-    drmModeAtomicAddProperty(areq, out->plane_id,
-                             out->prop_crtc_w, out->dest_w);
-    drmModeAtomicAddProperty(areq, out->plane_id,
-                             out->prop_crtc_h, out->dest_h);
-
-    drmModeAtomicAddProperty(areq, out->plane_id,
-                             out->prop_fb_id,   fb_id);
-    drmModeAtomicAddProperty(areq, out->plane_id,
-                             out->prop_crtc_id, out->crtc_id);
-
-    uint32_t flags = out->first_frame ? DRM_MODE_ATOMIC_ALLOW_MODESET : 0;
-    ret = drmModeAtomicCommit(ctx->fd, areq, flags, NULL);
-    drmModeAtomicFree(areq);
-
+    ret = do_atomic_commit(ctx->fd, out, fb_id,
+                           frame->width, frame->src_height, need_modeset);
     if (ret < 0) {
         perror("drm: atomic commit failed");
         drmModeRmFB(ctx->fd, fb_id);
@@ -400,20 +442,111 @@ int drm_present(DrmContext *ctx, int output_idx, DecodedFrame *frame)
         return -1;
     }
 
-    out->first_frame = 0;
+    out->first_frame    = 0;
+    out->current_format = DRM_FORMAT_NV12;
 
-    if (out->prev_fb_id) {
-        drmModeRmFB(ctx->fd, out->prev_fb_id);
-        out->prev_fb_id = 0;
-    }
-    if (out->prev_gem_handle) {
-        drmCloseBufferHandle(ctx->fd, out->prev_gem_handle);
-        out->prev_gem_handle = 0;
-    }
-
+    release_prev(ctx->fd, out);
     out->prev_fb_id      = fb_id;
     out->prev_gem_handle = gem_handle;
+    out->prev_is_dumb    = 0;
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+
+int drm_present_image(DrmContext *ctx, int output_idx,
+                       uint8_t *pixels, int width, int height, int stride)
+{
+    if (output_idx < 0 || output_idx >= ctx->output_count) {
+        fprintf(stderr, "drm: invalid output index %d\n", output_idx);
+        return -1;
+    }
+    DrmOutput *out = &ctx->outputs[output_idx];
+
+    /* Create a dumb buffer (CPU-writable, 32bpp XRGB8888) */
+    struct drm_mode_create_dumb creq;
+    memset(&creq, 0, sizeof(creq));
+    creq.width  = (uint32_t)width;
+    creq.height = (uint32_t)height;
+    creq.bpp    = 32;
+
+    if (drmIoctl(ctx->fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0) {
+        perror("drm: DRM_IOCTL_MODE_CREATE_DUMB");
+        return -1;
+    }
+
+    struct drm_mode_map_dumb mreq;
+    memset(&mreq, 0, sizeof(mreq));
+    mreq.handle = creq.handle;
+    if (drmIoctl(ctx->fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) < 0) {
+        perror("drm: DRM_IOCTL_MODE_MAP_DUMB");
+        goto destroy_dumb;
+    }
+
+    void *map = mmap(NULL, creq.size, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, ctx->fd, mreq.offset);
+    if (map == MAP_FAILED) {
+        perror("drm: mmap dumb buffer");
+        goto destroy_dumb;
+    }
+
+    /* Copy rows, accounting for dumb buffer pitch vs our stride */
+    for (int y = 0; y < height; y++) {
+        memcpy((uint8_t *)map + (size_t)y * creq.pitch,
+               pixels          + (size_t)y * stride,
+               (size_t)width * 4);
+    }
+    munmap(map, creq.size);
+
+    /* Register framebuffer */
+    uint32_t handles[4] = { creq.handle, 0, 0, 0 };
+    uint32_t pitches[4] = { creq.pitch,  0, 0, 0 };
+    uint32_t offsets[4] = { 0, 0, 0, 0 };
+    uint32_t fb_id = 0;
+    if (drmModeAddFB2(ctx->fd, (uint32_t)width, (uint32_t)height,
+                       DRM_FORMAT_XRGB8888,
+                       handles, pitches, offsets, &fb_id, 0) < 0) {
+        perror("drm: drmModeAddFB2 image");
+        goto destroy_dumb;
+    }
+
+    /* Recalculate dest rect for image dimensions (SAR is always 1:1) */
+    calc_dest_rect(out->mode_w, out->mode_h,
+                   (uint32_t)width, (uint32_t)height, 1, 1,
+                   &out->dest_x, &out->dest_y,
+                   &out->dest_w, &out->dest_h);
+
+    /* Need modeset if first frame or switching from video (NV12) to image (XRGB) */
+    int need_modeset = out->first_frame ||
+                       (out->current_format != DRM_FORMAT_XRGB8888);
+
+    if (do_atomic_commit(ctx->fd, out, fb_id,
+                          (uint32_t)width, (uint32_t)height,
+                          need_modeset) < 0) {
+        perror("drm: atomic commit image");
+        drmModeRmFB(ctx->fd, fb_id);
+        goto destroy_dumb;
+    }
+
+    out->first_frame    = 0;
+    out->current_format = DRM_FORMAT_XRGB8888;
+    /* Force dest_rect recalculation on next video frame */
+    out->vid_w = 0;
+    out->vid_h = 0;
+
+    release_prev(ctx->fd, out);
+    out->prev_fb_id      = fb_id;
+    out->prev_gem_handle = creq.handle;
+    out->prev_is_dumb    = 1;
+    return 0;
+
+destroy_dumb: {
+        struct drm_mode_destroy_dumb dreq;
+        memset(&dreq, 0, sizeof(dreq));
+        dreq.handle = creq.handle;
+        drmIoctl(ctx->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+    }
+    return -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -422,27 +555,26 @@ void drm_close(DrmContext *ctx)
 {
     for (int i = 0; i < ctx->output_count; i++) {
         DrmOutput *out = &ctx->outputs[i];
-        if (out->prev_fb_id) {
-            drmModeRmFB(ctx->fd, out->prev_fb_id);
-            out->prev_fb_id = 0;
-        }
-        if (out->prev_gem_handle) {
-            drmCloseBufferHandle(ctx->fd, out->prev_gem_handle);
-            out->prev_gem_handle = 0;
-        }
+
+        release_prev(ctx->fd, out);
+
         if (out->mode_blob_id) {
             drmModeDestroyPropertyBlob(ctx->fd, out->mode_blob_id);
             out->mode_blob_id = 0;
         }
-        drmModeSetCrtc(ctx->fd,
-                       out->prev_mode->crtc_id,
-                       out->prev_mode->buffer_id,
-                       out->prev_mode->x,
-                       out->prev_mode->y,
-                       &out->connector_id,
-                       1,
-                       &out->prev_mode->mode);
-        drmModeFreeCrtc(out->prev_mode);
+
+        /* Restore previous CRTC state */
+        if (out->prev_crtc) {
+            drmModeSetCrtc(ctx->fd,
+                           out->prev_crtc->crtc_id,
+                           out->prev_crtc->buffer_id,
+                           out->prev_crtc->x,
+                           out->prev_crtc->y,
+                           &out->connector_id, 1,
+                           &out->prev_crtc->mode);
+            drmModeFreeCrtc(out->prev_crtc);
+            out->prev_crtc = NULL;
+        }
     }
     if (ctx->fd >= 0) {
         close(ctx->fd);

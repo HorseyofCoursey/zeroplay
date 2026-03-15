@@ -1,27 +1,34 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 \
-          $(shell pkg-config --cflags libavformat libavcodec libavutil \
-                                      libswresample libdrm alsa)
-LDFLAGS = $(shell pkg-config --libs libavformat libavcodec libavutil \
-                                     libswresample libdrm alsa)
+CFLAGS  = -Wall -Wextra -O2
+CFLAGS += $(shell pkg-config --cflags libavformat libavcodec libavutil libswresample libswscale libdrm 2>/dev/null)
+CFLAGS += -I/usr/include/libdrm
 
-SRCS    = src/main.c src/queue.c src/demux.c src/audio.c src/vdec.c src/drm.c
-BIN     = zeroplay
+LIBS    = $(shell pkg-config --libs libavformat libavcodec libavutil libswresample libswscale libdrm 2>/dev/null)
+LIBS   += -lasound -lpthread
 
-PREFIX  ?= /usr/local
+TARGET  = zeroplay
+SRCDIR  = src
+SRCS    = $(SRCDIR)/main.c     \
+          $(SRCDIR)/queue.c    \
+          $(SRCDIR)/demux.c    \
+          $(SRCDIR)/audio.c    \
+          $(SRCDIR)/vdec.c     \
+          $(SRCDIR)/drm.c      \
+          $(SRCDIR)/sync.c     \
+          $(SRCDIR)/playlist.c \
+          $(SRCDIR)/image.c
 
-.PHONY: all install uninstall clean
+PREFIX  = /usr/local
 
-all: $(BIN)
+all: $(TARGET)
 
-$(BIN): $(SRCS)
-	$(CC) $(CFLAGS) $(SRCS) -o $(BIN) $(LDFLAGS) -lpthread
+$(TARGET): $(SRCS)
+	$(CC) $(CFLAGS) $(SRCS) -o $(TARGET) $(LIBS)
 
-install: $(BIN)
-	install -Dm755 $(BIN) $(PREFIX)/bin/$(BIN)
-
-uninstall:
-	rm -f $(PREFIX)/bin/$(BIN)
+install: $(TARGET)
+	install -m 755 $(TARGET) $(PREFIX)/bin/$(TARGET)
 
 clean:
-	rm -f $(BIN)
+	rm -f $(TARGET)
+
+.PHONY: all install clean

@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <getopt.h>
+#include <libgen.h>
 #include <libavformat/avformat.h>
 #include "queue.h"
 #include "demux.h"
@@ -15,6 +16,9 @@
 #include "vdec.h"
 #include "drm.h"
 #include "log.h"
+#include "sync.h"
+#include "playlist.h"
+#include "image.h"
 
 int g_verbose = 0;
 
@@ -37,40 +41,51 @@ int g_verbose = 0;
 #define MAX_FILES 4
 
 typedef struct {
-    const char *filenames[MAX_FILES];
-    int         file_count;
+    const char *paths[MAX_FILES];   /* files, dirs, or playlist files */
+    int         path_count;
     int         loop;
     int         no_audio;
     float       vol;
     double      start_pos;
     const char *audio_device;
+    float       image_duration_s;   /* seconds to show each image */
+    int         shuffle;
+    SyncRole    sync_role;
+    char        sync_master_ip[64];
 } Options;
 
 static void print_usage(void)
 {
     fprintf(stderr,
-        "usage: zeroplay [options] <file> [file2 ...]\n"
+        "usage: zeroplay [options] <path> [path2 ...]\n"
         "\n"
-        "  Up to %d files may be specified. Each file is assigned to a\n"
-        "  connected display in the order they are enumerated by DRM.\n"
+        "  Each path can be a video/image file, a .txt/.m3u playlist,\n"
+        "  or a directory. Up to %d paths may be given; each is assigned\n"
+        "  to a connected display in DRM enumeration order.\n"
         "\n"
         "options:\n"
-        "  --loop              loop playback indefinitely\n"
-        "  --no-audio          disable audio\n"
-        "  --vol n             initial volume 0-200 (default 100)\n"
-        "  --pos n             start position in seconds\n"
-        "  --audio-device dev  ALSA device (default: auto-detect)\n"
-        "  --verbose           print decoder/driver info\n"
-        "  --help              show this message\n"
+        "  --loop                  loop playlist indefinitely\n"
+        "  --shuffle               randomise playlist order\n"
+        "  --no-audio              disable audio\n"
+        "  --vol n                 initial volume 0-200 (default 100)\n"
+        "  --pos n                 start position in seconds (video only)\n"
+        "  --audio-device dev      ALSA device (default: auto-detect)\n"
+        "  --image-duration n      seconds per image (default 10, 0 = hold forever)\n"
+        "  --verbose               print decoder/driver info\n"
+        "  --sync-master           broadcast PTS for multi-Pi sync\n"
+        "  --sync-slave ip         receive PTS from master at <ip>\n"
+        "  --help                  show this message\n"
         "\n"
         "controls:\n"
-        "  p / space           pause / resume\n"
-        "  left / right        seek -/+ 1 minute\n"
-        "  up / down           seek -/+ 5 minutes\n"
-        "  + / -               volume up / down\n"
-        "  m                   mute / unmute\n"
-        "  i / o               previous / next chapter\n"
-        "  q / esc             quit\n",
+        "  p / space               pause / resume\n"
+        "  left / right            seek -/+ 1 minute\n"
+        "  up / down               seek -/+ 5 minutes\n"
+        "  + / -                   volume up / down\n"
+        "  m                       mute / unmute\n"
+        "  i / o                   previous / next chapter\n"
+        "  n                       skip to next playlist item\n"
+        "  b                       go to previous playlist item\n"
+        "  q / esc                 quit\n",
         MAX_FILES
     );
 }
@@ -78,28 +93,41 @@ static void print_usage(void)
 static int parse_args(int argc, char *argv[], Options *opt)
 {
     memset(opt, 0, sizeof(*opt));
-    opt->vol = 100.0f;
+    opt->vol              = 100.0f;
+    opt->image_duration_s = 10.0f;
 
     static struct option long_opts[] = {
-        { "loop",         no_argument,       NULL, 'l' },
-        { "no-audio",     no_argument,       NULL, 'n' },
-        { "vol",          required_argument, NULL, 'v' },
-        { "pos",          required_argument, NULL, 'p' },
-        { "audio-device", required_argument, NULL, 'a' },
-        { "verbose",      no_argument,       NULL, 'V' },
-        { "help",         no_argument,       NULL, 'h' },
+        { "loop",             no_argument,       NULL, 'l' },
+        { "shuffle",          no_argument,       NULL, 'r' },
+        { "no-audio",         no_argument,       NULL, 'n' },
+        { "vol",              required_argument, NULL, 'v' },
+        { "pos",              required_argument, NULL, 'p' },
+        { "audio-device",     required_argument, NULL, 'a' },
+        { "image-duration",   required_argument, NULL, 'd' },
+        { "verbose",          no_argument,       NULL, 'V' },
+        { "sync-master",      no_argument,       NULL, 'M' },
+        { "sync-slave",       required_argument, NULL, 'S' },
+        { "help",             no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
 
     int c;
     while ((c = getopt_long(argc, argv, "", long_opts, NULL)) != -1) {
         switch (c) {
-            case 'l': opt->loop         = 1;            break;
-            case 'n': opt->no_audio     = 1;            break;
-            case 'v': opt->vol          = atof(optarg); break;
-            case 'p': opt->start_pos    = atof(optarg); break;
-            case 'a': opt->audio_device = optarg;       break;
-            case 'V': g_verbose         = 1;            break;
+            case 'l': opt->loop             = 1;            break;
+            case 'r': opt->shuffle          = 1;            break;
+            case 'n': opt->no_audio         = 1;            break;
+            case 'v': opt->vol              = atof(optarg); break;
+            case 'p': opt->start_pos        = atof(optarg); break;
+            case 'a': opt->audio_device     = optarg;       break;
+            case 'd': opt->image_duration_s = atof(optarg); break;
+            case 'V': g_verbose             = 1;            break;
+            case 'M': opt->sync_role        = SYNC_MASTER;  break;
+            case 'S':
+                opt->sync_role = SYNC_SLAVE;
+                strncpy(opt->sync_master_ip, optarg,
+                        sizeof(opt->sync_master_ip) - 1);
+                break;
             case 'h': print_usage(); exit(0);
             default:
                 fprintf(stderr, "unknown option — run with --help\n");
@@ -109,11 +137,12 @@ static int parse_args(int argc, char *argv[], Options *opt)
 
     if (optind >= argc) { print_usage(); return -1; }
 
-    while (optind < argc && opt->file_count < MAX_FILES)
-        opt->filenames[opt->file_count++] = argv[optind++];
+    while (optind < argc && opt->path_count < MAX_FILES)
+        opt->paths[opt->path_count++] = argv[optind++];
 
     if (opt->vol < 0)   opt->vol = 0;
     if (opt->vol > 200) opt->vol = 200;
+    if (opt->image_duration_s < 0) opt->image_duration_s = 0;
 
     return 0;
 }
@@ -189,11 +218,14 @@ static volatile sig_atomic_t g_signal_quit = 0;
 static void signal_handler(int sig) { (void)sig; g_signal_quit = 1; }
 
 /* ------------------------------------------------------------------ */
-/* PlayerContext — all state for one file/output pair                  */
+/* PlayerContext — all state for one playlist/output pair              */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    /* Pipeline */
+    /* Playlist */
+    Playlist     playlist;
+
+    /* Video pipeline (only valid when !image_mode && pipeline_open) */
     DemuxContext demux;
     VdecContext  vdec;
     AudioContext audio;
@@ -201,6 +233,8 @@ typedef struct {
     Queue        audio_queue;
     Queue        frame_queue;
     pthread_t    dtid, vtid, atid;
+    int          pipeline_open;
+    int          audio_active;   /* 1 if audio was successfully opened */
 
     /* Playback state */
     int64_t      wall_start;
@@ -208,12 +242,16 @@ typedef struct {
     int64_t      current_pts;
     DecodedFrame *prev_frame;
     DecodedFrame *held_frame;
-    int          eos;          /* end of stream reached */
+    int          eos;
 
-    /* Config (copied from Options) */
+    /* Image mode */
+    int          image_mode;
+    int64_t      image_end_us;
+
+    /* Config */
     int          output_idx;
-    int          no_audio;
-    int          loop;
+    int          no_audio;       /* user flag: audio disabled for this player */
+    int64_t      image_duration_us;
     int64_t      duration_us;
 } PlayerContext;
 
@@ -225,24 +263,18 @@ typedef struct { PlayerContext *p; } ThreadArg;
 
 static void *demux_thread(void *arg)
 {
-    PlayerContext *p = ((ThreadArg *)arg)->p;
-    free(arg);
-    demux_run(&p->demux);
-    return NULL;
+    PlayerContext *p = ((ThreadArg *)arg)->p; free(arg);
+    demux_run(&p->demux); return NULL;
 }
 static void *vdec_thread(void *arg)
 {
-    PlayerContext *p = ((ThreadArg *)arg)->p;
-    free(arg);
-    vdec_run(&p->vdec);
-    return NULL;
+    PlayerContext *p = ((ThreadArg *)arg)->p; free(arg);
+    vdec_run(&p->vdec); return NULL;
 }
 static void *audio_thread(void *arg)
 {
-    PlayerContext *p = ((ThreadArg *)arg)->p;
-    free(arg);
-    audio_run(&p->audio);
-    return NULL;
+    PlayerContext *p = ((ThreadArg *)arg)->p; free(arg);
+    audio_run(&p->audio); return NULL;
 }
 
 static void player_threads_start(PlayerContext *p)
@@ -251,7 +283,7 @@ static void player_threads_start(PlayerContext *p)
     ThreadArg *va = malloc(sizeof(*va)); va->p = p;
     pthread_create(&p->dtid, NULL, demux_thread, da);
     pthread_create(&p->vtid, NULL, vdec_thread,  va);
-    if (!p->no_audio) {
+    if (p->audio_active) {
         ThreadArg *aa = malloc(sizeof(*aa)); aa->p = p;
         pthread_create(&p->atid, NULL, audio_thread, aa);
     }
@@ -264,7 +296,7 @@ static void player_threads_stop(PlayerContext *p)
     queue_close(&p->frame_queue);
     pthread_join(p->dtid, NULL);
     pthread_join(p->vtid, NULL);
-    if (!p->no_audio)
+    if (p->audio_active)
         pthread_join(p->atid, NULL);
 }
 
@@ -277,64 +309,48 @@ static void player_queues_reinit(PlayerContext *p)
     p->demux.audio_queue = &p->audio_queue;
     p->vdec.packet_queue = &p->video_queue;
     p->vdec.frame_queue  = &p->frame_queue;
-    if (!p->no_audio) p->audio.audio_queue = &p->audio_queue;
+    if (p->audio_active) p->audio.audio_queue = &p->audio_queue;
 }
 
 /* ------------------------------------------------------------------ */
-/* Seek / loop                                                          */
+/* Close the video pipeline without touching the playlist              */
 /* ------------------------------------------------------------------ */
 
-static void player_seek(PlayerContext *p, int64_t target_us)
+static void player_close_pipeline(PlayerContext *p)
 {
-    fprintf(stderr, "zeroplay[%d]: seeking to %.1fs...\n",
-            p->output_idx, target_us / 1e6);
+    if (!p->pipeline_open) return;
 
-    if (p->held_frame) { vdec_requeue_frame(&p->vdec, p->held_frame); p->held_frame = NULL; }
-    if (p->prev_frame) { vdec_requeue_frame(&p->vdec, p->prev_frame); p->prev_frame  = NULL; }
+    if (p->held_frame) {
+        vdec_requeue_frame(&p->vdec, p->held_frame); p->held_frame = NULL;
+    }
+    if (p->prev_frame) {
+        vdec_requeue_frame(&p->vdec, p->prev_frame); p->prev_frame = NULL;
+    }
 
     player_threads_stop(p);
-    demux_seek(&p->demux, target_us);
-    vdec_flush(&p->vdec);
-    if (!p->no_audio) audio_flush(&p->audio);
-    player_queues_reinit(p);
+    if (p->audio_active) audio_close(&p->audio);
+    vdec_close(&p->vdec);
+    demux_close(&p->demux);
+    queue_destroy(&p->video_queue);
+    queue_destroy(&p->audio_queue);
+    queue_destroy(&p->frame_queue);
 
-    p->wall_start  = 0;
-    p->frame_count = 0;
-    p->eos         = 0;
-
-    player_threads_start(p);
-}
-
-static void player_loop(PlayerContext *p)
-{
-    if (p->held_frame) { vdec_requeue_frame(&p->vdec, p->held_frame); p->held_frame = NULL; }
-    if (p->prev_frame) { vdec_requeue_frame(&p->vdec, p->prev_frame); p->prev_frame  = NULL; }
-
-    player_threads_stop(p);
-    demux_seek(&p->demux, 0);
-    vdec_flush(&p->vdec);
-    if (!p->no_audio) audio_flush(&p->audio);
-    player_queues_reinit(p);
-
-    p->wall_start  = 0;
-    p->frame_count = 0;
-    p->eos         = 0;
-
-    player_threads_start(p);
+    p->pipeline_open  = 0;
+    p->audio_active   = 0;
+    p->wall_start     = 0;
+    p->frame_count    = 0;
+    p->current_pts    = 0;
+    p->eos            = 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* Open / close one player                                             */
+/* Open the video pipeline for a single file                           */
+/* Does NOT start threads — call player_threads_start separately.      */
 /* ------------------------------------------------------------------ */
 
-static int player_open(PlayerContext *p, const char *filename,
-                       const Options *opt, int output_idx)
+static int player_open_video(PlayerContext *p, const char *filename,
+                              const Options *opt)
 {
-    memset(p, 0, sizeof(*p));
-    p->output_idx = output_idx;
-    p->no_audio   = opt->no_audio;
-    p->loop       = opt->loop;
-
     queue_init(&p->video_queue);
     queue_init(&p->audio_queue);
     queue_init_size(&p->frame_queue, FRAME_QUEUE_SIZE);
@@ -342,7 +358,7 @@ static int player_open(PlayerContext *p, const char *filename,
     if (demux_open(&p->demux, filename, &p->video_queue, &p->audio_queue) < 0)
         return -1;
 
-    if (opt->no_audio)
+    if (p->no_audio)
         p->demux.audio_stream_idx = -1;
 
     AVStream *video_stream =
@@ -351,25 +367,19 @@ static int player_open(PlayerContext *p, const char *filename,
     if (vdec_open(&p->vdec, video_stream, &p->video_queue, &p->frame_queue) < 0)
         return -1;
 
-    if (!opt->no_audio && p->demux.audio_stream_idx >= 0) {
+    p->audio_active = 0;
+    if (!p->no_audio && p->demux.audio_stream_idx >= 0) {
         AVStream *audio_stream =
             p->demux.fmt_ctx->streams[p->demux.audio_stream_idx];
-        /* Only first player gets audio — one audio output makes sense */
-        if (output_idx == 0) {
-            if (audio_open(&p->audio, audio_stream, opt->audio_device,
-                           &p->audio_queue) < 0)
-                return -1;
+        if (audio_open(&p->audio, audio_stream, opt->audio_device,
+                       &p->audio_queue) == 0) {
             p->audio.volume = opt->vol / 100.0f;
-        } else {
-            /* Secondary players: discard audio silently */
-            p->no_audio = 1;
-            p->demux.audio_stream_idx = -1;
+            p->audio_active = 1;
         }
-    } else {
-        p->no_audio = 1;
     }
 
-    p->duration_us = p->demux.duration_us;
+    p->duration_us   = p->demux.duration_us;
+    p->pipeline_open = 1;
 
     if (opt->start_pos > 0.0) {
         int64_t start_us = (int64_t)(opt->start_pos * 1000000.0);
@@ -382,6 +392,173 @@ static int player_open(PlayerContext *p, const char *filename,
 }
 
 /* ------------------------------------------------------------------ */
+/* Seek within the current video                                        */
+/* ------------------------------------------------------------------ */
+
+static void player_seek(PlayerContext *p, int64_t target_us)
+{
+    if (!p->pipeline_open) return;
+    fprintf(stderr, "zeroplay[%d]: seeking to %.1fs...\n",
+            p->output_idx, target_us / 1e6);
+
+    if (p->held_frame) { vdec_requeue_frame(&p->vdec, p->held_frame); p->held_frame = NULL; }
+    if (p->prev_frame) { vdec_requeue_frame(&p->vdec, p->prev_frame); p->prev_frame  = NULL; }
+
+    player_threads_stop(p);
+    demux_seek(&p->demux, target_us);
+    vdec_flush(&p->vdec);
+    if (p->audio_active) audio_flush(&p->audio);
+    player_queues_reinit(p);
+
+    p->wall_start  = 0;
+    p->frame_count = 0;
+    p->eos         = 0;
+
+    player_threads_start(p);
+}
+
+/* ------------------------------------------------------------------ */
+/* Advance to the next playlist item                                    */
+/* Returns 0 on success, -1 if the playlist is exhausted.              */
+/* ------------------------------------------------------------------ */
+
+static int player_advance_to_next(PlayerContext *p, DrmContext *drm,
+                                   const Options *opt)
+{
+    if (playlist_advance(&p->playlist) < 0)
+        return -1;
+
+    PlaylistItem *item = playlist_current(&p->playlist);
+    if (!item) return -1;
+
+    if (item->type == ITEM_IMAGE) {
+        player_close_pipeline(p);
+        p->image_mode = 0;
+
+        uint8_t *pixels = NULL;
+        int w = 0, h = 0, stride = 0;
+        if (image_decode_xrgb(item->path, &pixels, &w, &h, &stride) == 0) {
+            drm_present_image(drm, p->output_idx, pixels, w, h, stride);
+            free(pixels);
+            fprintf(stderr, "zeroplay[%d]: showing '%s'\n",
+                    p->output_idx, basename(item->path));
+        } else {
+            fprintf(stderr, "zeroplay[%d]: failed to decode image '%s', skipping\n",
+                    p->output_idx, item->path);
+            /* Try the next item immediately */
+            return player_advance_to_next(p, drm, opt);
+        }
+        p->image_mode   = 1;
+        p->image_end_us = (p->image_duration_us > 0) ? now_us() + p->image_duration_us : 0;
+
+    } else {
+        /* Video */
+        player_close_pipeline(p);
+        p->image_mode = 0;
+
+        if (player_open_video(p, item->path, opt) < 0) {
+            fprintf(stderr, "zeroplay[%d]: failed to open '%s', skipping\n",
+                    p->output_idx, item->path);
+            return player_advance_to_next(p, drm, opt);
+        }
+        fprintf(stderr, "zeroplay[%d]: playing '%s'\n",
+                p->output_idx, basename(item->path));
+        player_threads_start(p);
+    }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Open a player (playlist + first item)                               */
+/* ------------------------------------------------------------------ */
+
+static int player_open(PlayerContext *p, const char *path,
+                        const Options *opt, int output_idx, DrmContext *drm)
+{
+    memset(p, 0, sizeof(*p));
+    p->output_idx       = output_idx;
+    p->no_audio         = opt->no_audio || (output_idx != 0);
+    p->image_duration_us = (int64_t)(opt->image_duration_s * 1000000.0);
+
+    if (playlist_open(&p->playlist, path, opt->loop, opt->shuffle) < 0)
+        return -1;
+
+    PlaylistItem *item = playlist_current(&p->playlist);
+    if (!item) { playlist_close(&p->playlist); return -1; }
+
+    if (item->type == ITEM_IMAGE) {
+        uint8_t *pixels = NULL;
+        int w = 0, h = 0, stride = 0;
+        if (image_decode_xrgb(item->path, &pixels, &w, &h, &stride) == 0) {
+            drm_present_image(drm, output_idx, pixels, w, h, stride);
+            free(pixels);
+        } else {
+            /* First item failed — try advancing */
+            if (player_advance_to_next(p, drm, opt) < 0) {
+                playlist_close(&p->playlist);
+                return -1;
+            }
+            return 0;
+        }
+        p->image_mode   = 1;
+        p->image_end_us = (p->image_duration_us > 0) ? now_us() + p->image_duration_us : 0;
+        fprintf(stderr, "zeroplay[%d]: image '%s' (%.0fs)\n",
+                output_idx, item->path,
+                (double)p->image_duration_us / 1e6);
+
+    } else {
+        if (player_open_video(p, item->path, opt) < 0) {
+            playlist_close(&p->playlist);
+            return -1;
+        }
+        fprintf(stderr, "zeroplay[%d]: playing '%s'\n",
+                output_idx, basename(item->path));
+        /* Threads will be started in main after all players are opened */
+    }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Full player teardown                                                 */
+/* ------------------------------------------------------------------ */
+
+static void player_shutdown(PlayerContext *p)
+{
+    player_close_pipeline(p);
+    playlist_close(&p->playlist);
+}
+
+static void player_go_to_prev(PlayerContext *p, DrmContext *drm,
+                               const Options *opt)
+{
+    player_close_pipeline(p);
+    p->image_mode = 0;
+
+    if (playlist_prev(&p->playlist) < 0) return;
+
+    PlaylistItem *item = playlist_current(&p->playlist);
+    if (!item) return;
+
+    if (item->type == ITEM_IMAGE) {
+        uint8_t *pixels = NULL;
+        int w = 0, h = 0, stride = 0;
+        if (image_decode_xrgb(item->path, &pixels, &w, &h, &stride) == 0) {
+            drm_present_image(drm, p->output_idx, pixels, w, h, stride);
+            free(pixels);
+        }
+        p->image_mode   = 1;
+        p->image_end_us = (p->image_duration_us > 0) ? now_us() + p->image_duration_us : 0;
+        fprintf(stderr, "zeroplay[%d]: showing '%s'\n",
+                p->output_idx, basename(item->path));
+    } else {
+        if (player_open_video(p, item->path, opt) == 0)
+            player_threads_start(p);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[])
 {
@@ -389,17 +566,16 @@ int main(int argc, char *argv[])
     if (parse_args(argc, argv, &opt) < 0)
         return 1;
 
-    /* Open DRM first so we know how many outputs are available */
     DrmContext drm;
     if (drm_open(&drm) < 0)
         return 1;
 
-    /* Clamp file count to available outputs */
-    int player_count = opt.file_count;
+    /* Clamp path count to available outputs */
+    int player_count = opt.path_count;
     if (player_count > drm.output_count) {
         fprintf(stderr,
-                "zeroplay: %d file(s) specified but only %d output(s) connected"
-                " — ignoring extra files\n",
+                "zeroplay: %d path(s) given but only %d output(s) connected"
+                " — ignoring extra\n",
                 player_count, drm.output_count);
         player_count = drm.output_count;
     }
@@ -408,38 +584,43 @@ int main(int argc, char *argv[])
     PlayerContext players[MAX_FILES];
     int opened = 0;
     for (int i = 0; i < player_count; i++) {
-        if (player_open(&players[i], opt.filenames[i], &opt, i) < 0) {
-            fprintf(stderr, "zeroplay: failed to open '%s'\n", opt.filenames[i]);
-            /* Close already-opened players and exit */
-            for (int j = 0; j < opened; j++) {
-                queue_close(&players[j].video_queue);
-                queue_close(&players[j].audio_queue);
-                queue_close(&players[j].frame_queue);
-                pthread_join(players[j].dtid, NULL);
-                pthread_join(players[j].vtid, NULL);
-                if (!players[j].no_audio) {
-                    pthread_join(players[j].atid, NULL);
-                    audio_close(&players[j].audio);
-                }
-                vdec_close(&players[j].vdec);
-                demux_close(&players[j].demux);
-                queue_destroy(&players[j].video_queue);
-                queue_destroy(&players[j].audio_queue);
-                queue_destroy(&players[j].frame_queue);
-            }
+        if (player_open(&players[i], opt.paths[i], &opt, i, &drm) < 0) {
+            fprintf(stderr, "zeroplay: failed to open '%s'\n", opt.paths[i]);
+            for (int j = 0; j < opened; j++) player_shutdown(&players[j]);
             drm_close(&drm);
             return 1;
         }
         opened++;
     }
 
+    /* Sync setup */
+    SyncContext      sync_ctx;
+    volatile int64_t sync_pts = 0;
+
+    if (opt.sync_role == SYNC_MASTER) {
+        if (sync_init_master(&sync_ctx, &sync_pts) < 0) {
+            for (int i = 0; i < opened; i++) player_shutdown(&players[i]);
+            drm_close(&drm);
+            return 1;
+        }
+    } else if (opt.sync_role == SYNC_SLAVE) {
+        if (sync_init_slave(&sync_ctx, opt.sync_master_ip) < 0) {
+            for (int i = 0; i < opened; i++) player_shutdown(&players[i]);
+            drm_close(&drm);
+            return 1;
+        }
+    } else {
+        sync_ctx.role = SYNC_NONE;
+    }
+
     term_raw();
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
 
-    /* Start all pipelines */
+    /* Start video pipelines (skip image-mode players) */
     for (int i = 0; i < opened; i++)
-        player_threads_start(&players[i]);
+        if (!players[i].image_mode && players[i].pipeline_open)
+            player_threads_start(&players[i]);
 
     /* Raise main thread to realtime */
     {
@@ -447,29 +628,27 @@ int main(int argc, char *argv[])
         pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
     }
 
-    int     paused = 0;
-    int     quit   = 0;
+    int paused = 0;
+    int quit   = 0;
 
     while (!quit) {
         if (g_signal_quit) { quit = 1; break; }
 
         int key = key_poll();
 
-        /* Global controls — apply to all players */
-        if (key == 'q' || key == 'Q' || key == 27) {
-            quit = 1; break;
-        }
+        if (key == 'q' || key == 'Q' || key == 27) { quit = 1; break; }
 
         if (key == 'p' || key == 'P' || key == ' ') {
             paused = !paused;
             for (int i = 0; i < opened; i++) {
+                if (players[i].image_mode) continue;
                 if (paused) {
-                    if (!players[i].no_audio) audio_pause(&players[i].audio);
+                    if (players[i].audio_active) audio_pause(&players[i].audio);
                 } else {
                     if (players[i].held_frame)
                         players[i].wall_start =
                             now_us() - players[i].held_frame->pts_us;
-                    if (!players[i].no_audio) audio_resume(&players[i].audio);
+                    if (players[i].audio_active) audio_resume(&players[i].audio);
                 }
             }
             fprintf(stderr, "zeroplay: %s\n", paused ? "paused" : "playing");
@@ -477,7 +656,7 @@ int main(int argc, char *argv[])
 
         if (key == '+' || key == '=') {
             for (int i = 0; i < opened; i++)
-                if (!players[i].no_audio) {
+                if (players[i].audio_active) {
                     float v = audio_volume_up(&players[i].audio);
                     if (i == 0)
                         fprintf(stderr, "zeroplay: volume %.0f%%\n", v * 100.0f);
@@ -485,7 +664,7 @@ int main(int argc, char *argv[])
         }
         if (key == '-' || key == '_') {
             for (int i = 0; i < opened; i++)
-                if (!players[i].no_audio) {
+                if (players[i].audio_active) {
                     float v = audio_volume_down(&players[i].audio);
                     if (i == 0)
                         fprintf(stderr, "zeroplay: volume %.0f%%\n", v * 100.0f);
@@ -493,7 +672,7 @@ int main(int argc, char *argv[])
         }
         if (key == 'm' || key == 'M') {
             for (int i = 0; i < opened; i++)
-                if (!players[i].no_audio) {
+                if (players[i].audio_active) {
                     int muted = audio_toggle_mute(&players[i].audio);
                     if (i == 0)
                         fprintf(stderr, "zeroplay: %s\n",
@@ -501,8 +680,25 @@ int main(int argc, char *argv[])
                 }
         }
 
+        if (key == 'n' || key == 'N') {
+            for (int i = 0; i < opened; i++) {
+                player_close_pipeline(&players[i]);
+                players[i].image_mode = 0;
+                if (player_advance_to_next(&players[i], &drm, &opt) < 0)
+                    players[i].eos = 1;
+            }
+            fprintf(stderr, "zeroplay: skip\n");
+        }
+
+        if (key == 'b' || key == 'B') {
+            for (int i = 0; i < opened; i++)
+                player_go_to_prev(&players[i], &drm, &opt);
+            fprintf(stderr, "zeroplay: previous\n");
+        }
+
         if (key == 'o' || key == 'O' || key == 'i' || key == 'I') {
             for (int i = 0; i < opened; i++) {
+                if (players[i].image_mode || !players[i].pipeline_open) continue;
                 int64_t target = 0;
                 int found = (key == 'o' || key == 'O')
                     ? demux_next_chapter(&players[i].demux,
@@ -515,7 +711,8 @@ int main(int argc, char *argv[])
                     players[i].current_pts = target;
                     if (was_paused) {
                         paused = 1;
-                        if (!players[i].no_audio) audio_pause(&players[i].audio);
+                        if (players[i].audio_active)
+                            audio_pause(&players[i].audio);
                     }
                 }
             }
@@ -531,6 +728,7 @@ int main(int argc, char *argv[])
 
             int was_paused = paused; paused = 0;
             for (int i = 0; i < opened; i++) {
+                if (players[i].image_mode || !players[i].pipeline_open) continue;
                 int64_t target = players[i].current_pts + delta;
                 if (target < 0) target = 0;
                 if (players[i].duration_us > 0 &&
@@ -542,38 +740,52 @@ int main(int argc, char *argv[])
             if (was_paused) {
                 paused = 1;
                 for (int i = 0; i < opened; i++)
-                    if (!players[i].no_audio) audio_pause(&players[i].audio);
+                    if (players[i].audio_active) audio_pause(&players[i].audio);
             }
         }
 
         if (paused) { sleep_us(10000); continue; }
 
         /* ---- Advance each player ---- */
-        int64_t next_due  = INT64_MAX;
-        int     all_eos   = 1;
+        int64_t next_due = INT64_MAX;
+        int     all_eos  = 1;
 
         for (int i = 0; i < opened; i++) {
             PlayerContext *p = &players[i];
             if (p->eos) continue;
             all_eos = 0;
 
-            /* Get next frame if we don't have one held */
+            /* ---- Image mode ---- */
+            if (p->image_mode) {
+                if (p->image_end_us > 0 && now_us() >= p->image_end_us) {
+                    if (player_advance_to_next(p, &drm, &opt) < 0)
+                        p->eos = 1;
+                    else
+                        next_due = 0;
+                } else if (p->image_end_us > 0) {
+                    if (p->image_end_us < next_due)
+                        next_due = p->image_end_us;
+                } else {
+                    /* duration 0 = hold forever, sleep a bit */
+                    sleep_us(50000);
+                }
+                continue;
+            }
+
+            /* ---- Video mode ---- */
             if (!p->held_frame) {
                 void *item = NULL;
                 int rc = queue_trypop(&p->frame_queue, &item);
                 if (rc == 0) {
-                    /* No frame yet — try again next iteration */
                     next_due = 0;
                     continue;
                 }
                 if (rc < 0) {
-                    /* End of stream */
-                    if (p->loop) {
-                        player_loop(p);
-                        next_due = 0;
-                    } else {
+                    /* End of stream — advance to next playlist item */
+                    if (player_advance_to_next(p, &drm, &opt) < 0)
                         p->eos = 1;
-                    }
+                    else
+                        next_due = 0;
                     continue;
                 }
                 p->held_frame = (DecodedFrame *)item;
@@ -586,55 +798,40 @@ int main(int argc, char *argv[])
             if (p->frame_count == 1 || p->wall_start == 0)
                 p->wall_start = now_us() - frame->pts_us;
 
+            /* Sync */
+            if (i == 0) {
+                sync_pts = p->current_pts;
+                int64_t adj = sync_correct(&sync_ctx, p->current_pts);
+                if (adj != 0) p->wall_start += adj;
+            }
+
             int64_t due = p->wall_start + frame->pts_us;
             int64_t now = now_us();
 
             if (due <= now) {
-                /* Frame is due — present it */
                 drm_present(&drm, p->output_idx, frame);
                 p->held_frame = NULL;
                 if (p->prev_frame)
                     vdec_requeue_frame(&p->vdec, p->prev_frame);
                 p->prev_frame = frame;
             } else {
-                /* Not due yet — track when we next need to wake */
                 if (due < next_due) next_due = due;
             }
         }
 
         if (all_eos) break;
 
-        /* Sleep until the soonest frame is due, max 2ms */
         if (next_due != INT64_MAX) {
-            int64_t sleep = next_due - now_us();
-            if (sleep > 2000) sleep = 2000;
-            if (sleep > 0)    sleep_us(sleep);
+            int64_t sl = next_due - now_us();
+            if (sl > 2000) sl = 2000;
+            if (sl > 0)    sleep_us(sl);
         } else {
             sleep_us(2000);
         }
     }
 
-    /* Shutdown */
-    for (int i = 0; i < opened; i++) {
-        if (players[i].held_frame)
-            vdec_requeue_frame(&players[i].vdec, players[i].held_frame);
-        if (players[i].prev_frame)
-            vdec_requeue_frame(&players[i].vdec, players[i].prev_frame);
-        queue_close(&players[i].video_queue);
-        queue_close(&players[i].audio_queue);
-        queue_close(&players[i].frame_queue);
-        pthread_join(players[i].dtid, NULL);
-        pthread_join(players[i].vtid, NULL);
-        if (!players[i].no_audio)
-            pthread_join(players[i].atid, NULL);
-        if (!players[i].no_audio) audio_close(&players[i].audio);
-        vdec_close(&players[i].vdec);
-        demux_close(&players[i].demux);
-        queue_destroy(&players[i].video_queue);
-        queue_destroy(&players[i].audio_queue);
-        queue_destroy(&players[i].frame_queue);
-    }
-
+    sync_close(&sync_ctx);
+    for (int i = 0; i < opened; i++) player_shutdown(&players[i]);
     drm_close(&drm);
 
     fprintf(stderr, "have a nice day ;)\n");
