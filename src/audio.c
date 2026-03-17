@@ -276,9 +276,22 @@ int audio_open(AudioContext *ctx, AVStream *stream,
         return -1;
     }
 
-    vlog("audio: decoder opened — %s %d Hz %d ch (fmt=%s)\n",
-            codec->name, ctx->sample_rate, ctx->channels,
+    fprintf(stderr, "audio: decoder opened — %s profile=%d codecpar_rate=%d "
+            "codec_ctx_rate=%d ch=%d (fmt=%s)\n",
+            codec->name, ctx->codec_ctx->profile,
+            ctx->sample_rate, ctx->codec_ctx->sample_rate,
+            ctx->channels,
             av_get_sample_fmt_name(ctx->codec_ctx->sample_fmt));
+
+    /* If the codec context reports a different rate after open (e.g.
+     * HE-AAC base rate vs SBR-extended rate), trust the codec context. */
+    if (ctx->codec_ctx->sample_rate > 0 &&
+        ctx->codec_ctx->sample_rate != ctx->sample_rate) {
+        fprintf(stderr, "audio: codec_ctx rate %d != codecpar rate %d, "
+                "using codec_ctx rate\n",
+                ctx->codec_ctx->sample_rate, ctx->sample_rate);
+        ctx->sample_rate = ctx->codec_ctx->sample_rate;
+    }
 
     /* ------------------------------------------------------------------ */
     /* 2. Initialise swresample: float-planar → S16 interleaved            */
@@ -355,6 +368,9 @@ void audio_run(AudioContext *ctx)
     int consecutive_errors = 0;
     int total_frames       = 0;
     int total_errors       = 0;
+    int rate_checked       = 0;
+    int64_t prev_pts       = AV_NOPTS_VALUE;
+    int     prev_nb_samples = 0;
 
     fprintf(stderr, "audio: playback thread started\n");
 
@@ -403,6 +419,64 @@ void audio_run(AudioContext *ctx)
                         frame->sample_rate, ctx->sample_rate);
                 }
             }
+
+            /* ---------------------------------------------------------- */
+            /* PTS-based sample rate detection (runs once, on frame 3)  */
+            /*                                                          */
+            /* HE-AAC with SBR that isn't being applied will report     */
+            /* 48 kHz / 1024 samples but the PTS gap between frames     */
+            /* reveals the true rate (e.g. 24 kHz).  If we detect a     */
+            /* mismatch we reconfigure SwrContext so it resamples from   */
+            /* the real input rate to the ALSA output rate.              */
+            /* ---------------------------------------------------------- */
+            if (!rate_checked && total_frames >= 3 &&
+                prev_pts != AV_NOPTS_VALUE &&
+                frame->pts != AV_NOPTS_VALUE &&
+                frame->pts > prev_pts && prev_nb_samples > 0) {
+
+                double pts_dur = (frame->pts - prev_pts)
+                               * av_q2d(ctx->time_base);
+                int detected = (pts_dur > 0.001)
+                             ? (int)(prev_nb_samples / pts_dur + 0.5)
+                             : 0;
+
+                fprintf(stderr,
+                    "audio: PTS rate detect — pts_diff=%lld tb=%d/%d "
+                    "dur=%.6fs samples=%d → detected=%d Hz "
+                    "(configured in=%d out=%d)\n",
+                    (long long)(frame->pts - prev_pts),
+                    ctx->time_base.num, ctx->time_base.den,
+                    pts_dur, prev_nb_samples, detected,
+                    ctx->sample_rate, ctx->alsa_rate);
+
+                /* If the real input rate is significantly different,
+                 * reconfigure swr so it resamples correctly. */
+                if (detected > 0 &&
+                    abs(detected - ctx->sample_rate) > 2000) {
+
+                    fprintf(stderr,
+                        "audio: RATE MISMATCH — reconfiguring swr "
+                        "%d → %d Hz (was %d → %d)\n",
+                        detected, ctx->alsa_rate,
+                        ctx->sample_rate, ctx->alsa_rate);
+
+                    swr_close(ctx->swr_ctx);
+                    set_swr_layout(ctx->swr_ctx, ctx->codec_ctx);
+                    av_opt_set_int(ctx->swr_ctx, "in_sample_rate",
+                                   detected, 0);
+                    av_opt_set_sample_fmt(ctx->swr_ctx, "in_sample_fmt",
+                                   ctx->codec_ctx->sample_fmt, 0);
+                    av_opt_set_int(ctx->swr_ctx, "out_sample_rate",
+                                   ctx->alsa_rate, 0);
+                    av_opt_set_sample_fmt(ctx->swr_ctx, "out_sample_fmt",
+                                   AV_OUT_FORMAT, 0);
+                    swr_init(ctx->swr_ctx);
+                    ctx->sample_rate = detected;
+                }
+                rate_checked = 1;
+            }
+            prev_pts        = frame->pts;
+            prev_nb_samples = frame->nb_samples;
 
             /* Periodic progress log (every ~21s at 48 kHz) */
             if (total_frames % 1000 == 0)
