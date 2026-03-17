@@ -5,7 +5,8 @@
 #include <libavutil/version.h>
 
 int demux_open(DemuxContext *ctx, const char *filename,
-               Queue *video_queue, Queue *audio_queue)
+               Queue *video_queue, Queue *audio_queue,
+               int64_t hls_max_bandwidth)
 {
     ctx->fmt_ctx          = NULL;
     ctx->video_stream_idx = -1;
@@ -14,10 +15,19 @@ int demux_open(DemuxContext *ctx, const char *filename,
     ctx->video_queue      = video_queue;
     ctx->audio_queue      = audio_queue;
 
-    if (avformat_open_input(&ctx->fmt_ctx, filename, NULL, NULL) < 0) {
-        fprintf(stderr, "demux: could not open file: %s\n", filename);
+    AVDictionary *opts = NULL;
+    if (hls_max_bandwidth > 0) {
+        char bw_str[32];
+        snprintf(bw_str, sizeof(bw_str), "%lld", (long long)hls_max_bandwidth);
+        av_dict_set(&opts, "hls_max_bandwidth", bw_str, 0);
+    }
+
+    if (avformat_open_input(&ctx->fmt_ctx, filename, NULL, &opts) < 0) {
+        av_dict_free(&opts);
+        fprintf(stderr, "demux: could not open: %s\n", filename);
         return -1;
     }
+    av_dict_free(&opts);
 
     if (avformat_find_stream_info(ctx->fmt_ctx, NULL) < 0) {
         fprintf(stderr, "demux: could not find stream info\n");

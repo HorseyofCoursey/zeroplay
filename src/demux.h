@@ -14,7 +14,8 @@ typedef struct {
 } DemuxContext;
 
 int  demux_open(DemuxContext *ctx, const char *filename,
-                Queue *video_queue, Queue *audio_queue);
+                Queue *video_queue, Queue *audio_queue,
+                int64_t hls_max_bandwidth);
 void demux_run(DemuxContext *ctx);
 int  demux_seek(DemuxContext *ctx, int64_t target_us);
 int  demux_next_chapter(DemuxContext *ctx, int64_t current_us, int64_t *target_us);
