@@ -49,6 +49,7 @@ typedef struct {
     const char *audio_device;
     float       image_duration_s;   /* seconds to show each image */
     int         shuffle;
+    int64_t     hls_max_bandwidth;  /* --hls-bitrate or HLS_MAX_BANDWIDTH */
 } Options;
 
 static void print_usage(void)
@@ -70,6 +71,7 @@ static void print_usage(void)
         "  --image-duration n      seconds per image (default 10, 0 = hold forever)\n"
         "  --verbose               print decoder/driver info\n"
         "  --help                  show this message\n"
+        "\n"
         "\n"
         "controls:\n"
         "  p / space               pause / resume\n"
@@ -116,10 +118,24 @@ static int parse_args(int argc, char *argv[], Options *opt)
             case 'd': opt->image_duration_s = atof(optarg); break;
             case 'V': g_verbose             = 1;            break;
             case 'h': print_usage(); exit(0);
+            case 'B': opt->hls_max_bandwidth = atoll(optarg); break;
             default:
                 fprintf(stderr, "unknown option — run with --help\n");
                 return -1;
         }
+    }
+
+    /* Environment variable fallbacks */
+    }
+    if (opt->hls_max_bandwidth == 0) {
+        const char *hb = getenv("HLS_MAX_BANDWIDTH");
+        if (!hb) hb = getenv("MPV_HLS_BITRATE");
+        if (hb) opt->hls_max_bandwidth = atoll(hb);
+    }
+    if (!opt->audio_device) {
+        const char *ad = getenv("AUDIO_DEVICE");
+        if (!ad) ad = getenv("MPV_AUDIO_DEVICE");
+        if (ad && strcmp(ad, "auto") != 0) opt->audio_device = ad;
     }
 
     if (optind >= argc) { print_usage(); return -1; }
@@ -203,6 +219,19 @@ static void sleep_us(int64_t us)
 
 static volatile sig_atomic_t g_signal_quit = 0;
 static void signal_handler(int sig) { (void)sig; g_signal_quit = 1; }
+
+/* Crash handler — log diagnostic info before dying */
+static void crash_handler(int sig)
+{
+    const char *name = sig == SIGSEGV ? "SIGSEGV" :
+                       sig == SIGABRT ? "SIGABRT" :
+                       sig == SIGBUS  ? "SIGBUS"  : "UNKNOWN";
+    fprintf(stderr, "\n[zeroplay] CRASH: signal %s (%d)\n", name, sig);
+    fflush(stderr);
+    /* Re-raise to get default behavior (core dump) */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
 
 /* ------------------------------------------------------------------ */
 /* PlayerContext — all state for one playlist/output pair              */
@@ -342,7 +371,8 @@ static int player_open_video(PlayerContext *p, const char *filename,
     queue_init(&p->audio_queue);
     queue_init_size(&p->frame_queue, FRAME_QUEUE_SIZE);
 
-    if (demux_open(&p->demux, filename, &p->video_queue, &p->audio_queue) < 0)
+    if (demux_open(&p->demux, filename, &p->video_queue, &p->audio_queue,
+                   opt->hls_max_bandwidth) < 0)
         return -1;
 
     if (p->no_audio)
@@ -546,12 +576,18 @@ static void player_go_to_prev(PlayerContext *p, DrmContext *drm,
 }
 
 /* ------------------------------------------------------------------ */
+/* WebSocket mode                                                       */
+/* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[])
 {
     Options opt;
     if (parse_args(argc, argv, &opt) < 0)
         return 1;
+
+    avformat_network_init();
+
+    /* --- Legacy standalone mode below --- */
 
     DrmContext drm;
     if (drm_open(&drm) < 0)
