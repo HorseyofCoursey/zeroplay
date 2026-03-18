@@ -49,6 +49,7 @@ typedef struct {
     const char *audio_device;
     float       image_duration_s;   /* seconds to show each image */
     int         shuffle;
+    int64_t     hls_max_bandwidth;  /* --hls-bitrate or HLS_MAX_BANDWIDTH */
 } Options;
 
 static void print_usage(void)
@@ -100,6 +101,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
         { "audio-device",     required_argument, NULL, 'a' },
         { "image-duration",   required_argument, NULL, 'd' },
         { "verbose",          no_argument,       NULL, 'V' },
+        { "hls-bitrate",      required_argument, NULL, 'B' },
         { "help",             no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 }
     };
@@ -115,11 +117,18 @@ static int parse_args(int argc, char *argv[], Options *opt)
             case 'a': opt->audio_device     = optarg;       break;
             case 'd': opt->image_duration_s = atof(optarg); break;
             case 'V': g_verbose             = 1;            break;
+            case 'B': opt->hls_max_bandwidth = atoll(optarg); break;
             case 'h': print_usage(); exit(0);
             default:
                 fprintf(stderr, "unknown option — run with --help\n");
                 return -1;
         }
+    }
+
+    /* Environment variable fallbacks */
+    if (opt->hls_max_bandwidth == 0) {
+        const char *hb = getenv("HLS_MAX_BANDWIDTH");
+        if (hb) opt->hls_max_bandwidth = atoll(hb);
     }
 
     if (optind >= argc) { print_usage(); return -1; }
@@ -342,7 +351,8 @@ static int player_open_video(PlayerContext *p, const char *filename,
     queue_init(&p->audio_queue);
     queue_init_size(&p->frame_queue, FRAME_QUEUE_SIZE);
 
-    if (demux_open(&p->demux, filename, &p->video_queue, &p->audio_queue) < 0)
+    if (demux_open(&p->demux, filename, &p->video_queue, &p->audio_queue,
+                   opt->hls_max_bandwidth) < 0)
         return -1;
 
     if (p->no_audio)
@@ -552,6 +562,8 @@ int main(int argc, char *argv[])
     Options opt;
     if (parse_args(argc, argv, &opt) < 0)
         return 1;
+
+    avformat_network_init();
 
     DrmContext drm;
     if (drm_open(&drm) < 0)

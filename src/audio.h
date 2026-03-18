@@ -18,7 +18,8 @@ typedef struct {
     SwrContext      *swr_ctx;
 
     /* Stream info */
-    int              sample_rate;
+    int              sample_rate;    /* codec sample rate (input to swr) */
+    int              alsa_rate;     /* actual ALSA hardware rate (output of swr) */
     int              channels;
     AVRational       time_base;
 

@@ -9,8 +9,8 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <sys/select.h>
-#include <drm/drm_fourcc.h>
-#include <drm/drm_mode.h>
+#include <drm_fourcc.h>
+#include <drm_mode.h>
 
 /* ------------------------------------------------------------------ */
 /* Internal helpers                                                     */

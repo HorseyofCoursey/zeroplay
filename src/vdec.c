@@ -652,8 +652,9 @@ int vdec_flush(VdecContext *ctx)
     req.memory = V4L2_MEMORY_MMAP;
     xioctl(ctx->fd, VIDIOC_REQBUFS, &req);
 
-    /* Flush BSF */
-    av_bsf_flush(ctx->bsf);
+    /* Flush BSF (may be NULL for Annex B streams like HLS/TS) */
+    if (ctx->bsf)
+        av_bsf_flush(ctx->bsf);
 
     /* Restart output streaming */
     type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
