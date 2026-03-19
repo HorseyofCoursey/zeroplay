@@ -18,6 +18,9 @@
 #include "log.h"
 #include "playlist.h"
 #include "image.h"
+#ifdef HAVE_WEBSOCKET
+#include "ws.h"
+#endif
 
 int g_verbose = 0;
 
@@ -49,6 +52,12 @@ typedef struct {
     const char *audio_device;
     float       image_duration_s;   /* seconds to show each image */
     int         shuffle;
+    /* WebSocket mode */
+#ifdef HAVE_WEBSOCKET
+    const char *ws_url;             /* --ws-url or BACKEND_WS_URL */
+    const char *device_token;       /* --device-token or DEVICE_TOKEN */
+    int         health_port;        /* --health-port or HEALTH_PORT */
+#endif
     int64_t     hls_max_bandwidth;  /* --hls-bitrate or HLS_MAX_BANDWIDTH */
 } Options;
 
@@ -68,9 +77,15 @@ static void print_usage(void)
         "  --vol n                 initial volume 0-200 (default 100)\n"
         "  --pos n                 start position in seconds (video only)\n"
         "  --audio-device dev      ALSA device (default: auto-detect)\n"
+        "  --hls-bitrate BPS       max HLS bandwidth in bps (or HLS_MAX_BANDWIDTH env)\n"
         "  --image-duration n      seconds per image (default 10, 0 = hold forever)\n"
         "  --verbose               print decoder/driver info\n"
         "  --help                  show this message\n"
+        "\n"
+        "websocket mode:\n"
+        "  --ws-url URL            backend WebSocket URL (or BACKEND_WS_URL env)\n"
+        "  --device-token TOKEN    device auth token (or DEVICE_TOKEN env)\n"
+        "  --health-port PORT      health HTTP port (default 3000, or HEALTH_PORT env)\n"
         "\n"
         "controls:\n"
         "  p / space               pause / resume\n"
@@ -103,6 +118,10 @@ static int parse_args(int argc, char *argv[], Options *opt)
         { "verbose",          no_argument,       NULL, 'V' },
         { "hls-bitrate",      required_argument, NULL, 'B' },
         { "help",             no_argument,       NULL, 'h' },
+        { "ws-url",           required_argument, NULL, 'W' },
+        { "device-token",     required_argument, NULL, 'T' },
+        { "health-port",      required_argument, NULL, 'H' },
+        { "hls-bitrate",      required_argument, NULL, 'B' },
         { NULL, 0, NULL, 0 }
     };
 
@@ -119,6 +138,12 @@ static int parse_args(int argc, char *argv[], Options *opt)
             case 'V': g_verbose             = 1;            break;
             case 'B': opt->hls_max_bandwidth = atoll(optarg); break;
             case 'h': print_usage(); exit(0);
+#ifdef HAVE_WEBSOCKET
+            case 'W': opt->ws_url           = optarg;       break;
+            case 'T': opt->device_token     = optarg;       break;
+            case 'H': opt->health_port      = atoi(optarg); break;
+#endif
+            case 'B': opt->hls_max_bandwidth = atoll(optarg); break;
             default:
                 fprintf(stderr, "unknown option — run with --help\n");
                 return -1;
@@ -131,7 +156,31 @@ static int parse_args(int argc, char *argv[], Options *opt)
         if (hb) opt->hls_max_bandwidth = atoll(hb);
     }
 
+#ifdef HAVE_WEBSOCKET
+    if (!opt->ws_url)       opt->ws_url = getenv("BACKEND_WS_URL");
+    if (!opt->device_token) opt->device_token = getenv("DEVICE_TOKEN");
+    if (opt->health_port == 0) {
+        const char *hp = getenv("HEALTH_PORT");
+        opt->health_port = hp ? atoi(hp) : 3000;
+    }
+#endif
+    if (opt->hls_max_bandwidth == 0) {
+        const char *hb = getenv("HLS_MAX_BANDWIDTH");
+        if (!hb) hb = getenv("MPV_HLS_BITRATE");
+        if (hb) opt->hls_max_bandwidth = atoll(hb);
+    }
+    if (!opt->audio_device) {
+        const char *ad = getenv("AUDIO_DEVICE");
+        if (!ad) ad = getenv("MPV_AUDIO_DEVICE");
+        if (ad && strcmp(ad, "auto") != 0) opt->audio_device = ad;
+    }
+
+    /* In ws mode, files are optional */
+#ifdef HAVE_WEBSOCKET
+    if (optind >= argc && !opt->ws_url) { print_usage(); return -1; }
+#else
     if (optind >= argc) { print_usage(); return -1; }
+#endif
 
     while (optind < argc && opt->path_count < MAX_FILES)
         opt->paths[opt->path_count++] = argv[optind++];
@@ -212,6 +261,19 @@ static void sleep_us(int64_t us)
 
 static volatile sig_atomic_t g_signal_quit = 0;
 static void signal_handler(int sig) { (void)sig; g_signal_quit = 1; }
+
+/* Crash handler — log diagnostic info before dying */
+static void crash_handler(int sig)
+{
+    const char *name = sig == SIGSEGV ? "SIGSEGV" :
+                       sig == SIGABRT ? "SIGABRT" :
+                       sig == SIGBUS  ? "SIGBUS"  : "UNKNOWN";
+    fprintf(stderr, "\n[zeroplay] CRASH: signal %s (%d)\n", name, sig);
+    fflush(stderr);
+    /* Re-raise to get default behavior (core dump) */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
 
 /* ------------------------------------------------------------------ */
 /* PlayerContext — all state for one playlist/output pair              */
@@ -556,6 +618,228 @@ static void player_go_to_prev(PlayerContext *p, DrmContext *drm,
 }
 
 /* ------------------------------------------------------------------ */
+/* WebSocket mode                                                       */
+/* ------------------------------------------------------------------ */
+
+#ifdef HAVE_WEBSOCKET
+static int run_ws_mode(Options *opt)
+{
+    DrmContext drm;
+    if (drm_open(&drm) < 0)
+        return 1;
+
+    WsCmdQueue    cmd_queue;
+    WsSharedState shared;
+    ws_cmd_queue_init(&cmd_queue);
+    ws_shared_state_init(&shared);
+    ws_shared_state_set_player_ready(&shared, 1);
+
+    WsConfig ws_cfg = {
+        .backend_ws_url  = opt->ws_url,
+        .device_token    = opt->device_token,
+        .health_port     = opt->health_port,
+        .state_interval_ms = 5000,
+        .ping_interval_ms  = 20000,
+    };
+
+    WsContext *ws = ws_create(&ws_cfg, &cmd_queue, &shared);
+    if (!ws) {
+        fprintf(stderr, "zeroplay: failed to create ws context\n");
+        drm_close(&drm);
+        return 1;
+    }
+    if (ws_start(ws) < 0) {
+        ws_destroy(ws);
+        drm_close(&drm);
+        return 1;
+    }
+
+    signal(SIGINT,  signal_handler);
+    signal(SIGTERM, signal_handler);
+    signal(SIGSEGV, crash_handler);
+    signal(SIGABRT, crash_handler);
+    signal(SIGBUS,  crash_handler);
+
+    /* Raise main thread to realtime */
+    {
+        struct sched_param sp = { .sched_priority = 10 };
+        pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+    }
+
+    PlayerContext player;
+    memset(&player, 0, sizeof(player));
+    player.output_idx = 0;
+    player.no_audio   = opt->no_audio;
+
+    int paused = 0;
+    int audio_started = 0;   /* defer audio until first DRM frame */
+
+    fprintf(stderr, "zeroplay: ws mode — idle, waiting for commands\n");
+
+    while (!g_signal_quit) {
+        /* --- Process WebSocket commands --- */
+        WsCommand cmd;
+        while (ws_cmd_queue_pop(&cmd_queue, &cmd)) {
+            switch (cmd.type) {
+            case CMD_LOAD:
+                fprintf(stderr, "zeroplay: load %s\n", cmd.url);
+                player_close_pipeline(&player);
+                paused = 0;
+                audio_started = 0;
+                if (player_open_video(&player, cmd.url, opt) < 0) {
+                    fprintf(stderr, "zeroplay: failed to open %s\n", cmd.url);
+                    ws_shared_state_set_idle(&shared, 1);
+                    ws_shared_state_set_url(&shared, NULL);
+                    ws_shared_state_set_position(&shared, -1.0);
+                } else {
+                    /* Pause audio BEFORE starting threads so the audio
+                     * thread blocks immediately.  We unpause after the
+                     * first DRM frame is presented — this avoids writing
+                     * to the HDMI ALSA device while DRM is still
+                     * configuring the connector. */
+                    if (player.audio_active)
+                        audio_pause(&player.audio);
+                    player_threads_start(&player);
+                    ws_shared_state_set_idle(&shared, 0);
+                    ws_shared_state_set_url(&shared, cmd.url);
+                    ws_shared_state_set_paused(&shared, 0);
+                }
+                break;
+
+            case CMD_PLAY:
+                if (player.pipeline_open && paused) {
+                    paused = 0;
+                    if (player.held_frame)
+                        player.wall_start = now_us() - player.held_frame->pts_us;
+                    if (player.audio_active && audio_started)
+                        audio_resume(&player.audio);
+                    ws_shared_state_set_paused(&shared, 0);
+                    fprintf(stderr, "zeroplay: play\n");
+                }
+                break;
+
+            case CMD_PAUSE:
+                if (player.pipeline_open && !paused) {
+                    paused = 1;
+                    if (player.audio_active)
+                        audio_pause(&player.audio);
+                    ws_shared_state_set_paused(&shared, 1);
+                    fprintf(stderr, "zeroplay: pause\n");
+                }
+                break;
+
+            case CMD_STOP:
+                fprintf(stderr, "zeroplay: stop\n");
+                player_close_pipeline(&player);
+                paused = 0;
+                ws_shared_state_set_idle(&shared, 1);
+                ws_shared_state_set_url(&shared, NULL);
+                ws_shared_state_set_position(&shared, -1.0);
+                ws_shared_state_set_paused(&shared, 0);
+                break;
+
+            case CMD_SEEK:
+                if (player.pipeline_open) {
+                    int64_t target_us = cmd.seek_position_ms * 1000LL;
+                    if (target_us < 0) target_us = 0;
+                    if (player.duration_us > 0 && target_us > player.duration_us)
+                        target_us = player.duration_us;
+                    int was_paused = paused;
+                    paused = 0;
+                    player_seek(&player, target_us);
+                    player.current_pts = target_us;
+                    ws_shared_state_set_position(&shared, target_us / 1e6);
+                    if (was_paused) {
+                        paused = 1;
+                        if (player.audio_active)
+                            audio_pause(&player.audio);
+                    }
+                    fprintf(stderr, "zeroplay: seek to %.1fs\n", target_us / 1e6);
+                }
+                break;
+
+            default:
+                break;
+            }
+        }
+
+        /* --- Idle mode: no pipeline, just sleep --- */
+        if (!player.pipeline_open) {
+            sleep_us(50000);  /* 50ms idle poll */
+            continue;
+        }
+
+        if (paused) {
+            sleep_us(10000);
+            continue;
+        }
+
+        /* --- Frame presentation --- */
+        PlayerContext *p = &player;
+
+        if (!p->held_frame) {
+            void *item = NULL;
+            int rc = queue_trypop(&p->frame_queue, &item);
+            if (rc == 0) {
+                sleep_us(2000);
+                continue;
+            }
+            if (rc < 0) {
+                /* End of stream — go idle */
+                fprintf(stderr, "zeroplay: end of stream\n");
+                player_close_pipeline(p);
+                ws_shared_state_set_idle(&shared, 1);
+                ws_shared_state_set_position(&shared, -1.0);
+                ws_shared_state_set_paused(&shared, 0);
+                continue;
+            }
+            p->held_frame = (DecodedFrame *)item;
+            p->frame_count++;
+        }
+
+        DecodedFrame *frame = p->held_frame;
+        p->current_pts = frame->pts_us;
+        ws_shared_state_set_position(&shared, frame->pts_us / 1e6);
+
+        if (p->frame_count == 1 || p->wall_start == 0)
+            p->wall_start = now_us() - frame->pts_us;
+
+        int64_t due = p->wall_start + frame->pts_us;
+        int64_t now = now_us();
+
+        if (due <= now) {
+            drm_present(&drm, 0, frame);
+
+            /* Start audio after first frame is on screen — the HDMI
+             * output is now stable so ALSA writes won't get EFAULT. */
+            if (!audio_started && p->audio_active && !paused) {
+                audio_resume(&p->audio);
+                audio_started = 1;
+                fprintf(stderr, "zeroplay: audio started (after first frame)\n");
+            }
+
+            p->held_frame = NULL;
+            if (p->prev_frame)
+                vdec_requeue_frame(&p->vdec, p->prev_frame);
+            p->prev_frame = frame;
+        } else {
+            int64_t sl = due - now;
+            if (sl > 2000) sl = 2000;
+            if (sl > 0) sleep_us(sl);
+        }
+    }
+
+    fprintf(stderr, "zeroplay: shutting down\n");
+    player_close_pipeline(&player);
+    ws_destroy(ws);
+    ws_cmd_queue_destroy(&cmd_queue);
+    ws_shared_state_destroy(&shared);
+    drm_close(&drm);
+    return 0;
+}
+#endif /* HAVE_WEBSOCKET */
+
+/* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[])
 {
@@ -564,6 +848,18 @@ int main(int argc, char *argv[])
         return 1;
 
     avformat_network_init();
+
+#ifdef HAVE_WEBSOCKET
+    if (opt.ws_url && opt.ws_url[0]) {
+        if (!opt.device_token || !opt.device_token[0]) {
+            fprintf(stderr, "zeroplay: --device-token required with --ws-url\n");
+            return 1;
+        }
+        int ret = run_ws_mode(&opt);
+        avformat_network_deinit();
+        return ret;
+    }
+#endif
 
     DrmContext drm;
     if (drm_open(&drm) < 0)

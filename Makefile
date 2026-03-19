@@ -6,6 +6,14 @@ CFLAGS += -I/usr/include/libdrm
 LIBS    = $(shell pkg-config --libs libavformat libavcodec libavutil libswresample libswscale libdrm libcjson 2>/dev/null)
 LIBS   += -lasound -lpthread
 
+# WebSocket remote control (opt-in: make WS=1)
+ifdef WS
+CFLAGS += -DHAVE_WEBSOCKET
+CFLAGS += $(shell pkg-config --cflags libwebsockets 2>/dev/null)
+LIBS   += $(shell pkg-config --libs libwebsockets 2>/dev/null)
+WS_SRC  = $(SRCDIR)/ws.c
+endif
+
 TARGET  = zeroplay
 SRCDIR  = src
 SRCS    = $(SRCDIR)/main.c     \
@@ -16,6 +24,7 @@ SRCS    = $(SRCDIR)/main.c     \
           $(SRCDIR)/drm.c      \
           $(SRCDIR)/playlist.c \
           $(SRCDIR)/image.c    \
+          $(WS_SRC)
 
 PREFIX  = /usr/local
 
