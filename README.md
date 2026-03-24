@@ -330,7 +330,7 @@ No X11, no Wayland, no GPU compositing. Runs directly on the framebuffer from a 
 | Image display | No | Yes |
 | HLS streaming | No | Yes |
 | WebSocket remote control | No | Yes (opt-in) |
-| Subtitles | Yes | No |
+| Subtitles | Yes | Yes |
 | Chapter skip | No | Yes |
 | Seeking | Yes | Yes |
 | Volume control | Yes | Yes |
