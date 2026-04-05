@@ -1,9 +1,9 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -O2
-CFLAGS += $(shell pkg-config --cflags libavformat libavcodec libavutil libswresample libswscale libdrm libcjson 2>/dev/null)
+CFLAGS += $(shell pkg-config --cflags libavformat libavcodec libavutil libswresample libswscale libdrm 2>/dev/null)
 CFLAGS += -I/usr/include/libdrm
 
-LIBS    = $(shell pkg-config --libs libavformat libavcodec libavutil libswresample libswscale libdrm libcjson 2>/dev/null)
+LIBS    = $(shell pkg-config --libs libavformat libavcodec libavutil libswresample libswscale libdrm 2>/dev/null)
 LIBS   += -lasound -lpthread
 
 # FreeType2 subtitle rendering (auto-detected)
@@ -20,8 +20,8 @@ endif
 # WebSocket remote control (opt-in: make WS=1)
 ifdef WS
 CFLAGS += -DHAVE_WEBSOCKET
-CFLAGS += $(shell pkg-config --cflags libwebsockets 2>/dev/null)
-LIBS   += $(shell pkg-config --libs libwebsockets 2>/dev/null)
+CFLAGS += $(shell pkg-config --cflags libwebsockets libcjson 2>/dev/null)
+LIBS   += $(shell pkg-config --libs libwebsockets libcjson 2>/dev/null)
 WS_SRC  = $(SRCDIR)/ws.c
 endif
 

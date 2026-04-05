@@ -1,0 +1,14 @@
+FROM --platform=linux/arm64 debian:bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc make pkgconf libc6-dev \
+    libavformat-dev libavcodec-dev libavutil-dev \
+    libswresample-dev libswscale-dev \
+    libdrm-dev libasound2-dev \
+    libfreetype-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Makefile ./
+COPY src/ src/
+RUN make

@@ -62,7 +62,7 @@ This will install dependencies, build from source, and place the binary at `/usr
 ```bash
 sudo apt install git gcc make pkgconf \
   libavformat-dev libavcodec-dev libavutil-dev libswresample-dev libswscale-dev \
-  libdrm-dev libasound2-dev libcjson-dev
+  libdrm-dev libasound2-dev
 
 git clone https://github.com/HorseyofCoursey/zeroplay.git
 cd zeroplay
@@ -70,12 +70,22 @@ make
 sudo make install
 ```
 
+### Cross-compile from x86 Linux
+
+If you'd rather build on your desktop/laptop instead of the Pi:
+
+```bash
+./cross-build.sh
+```
+
+This uses Docker with QEMU emulation to build a native aarch64 binary. Requires Docker with buildx. The resulting `zeroplay` binary can be copied to the Pi with `scp`.
+
 ### WebSocket remote control (optional)
 
 To build with WebSocket remote control support:
 
 ```bash
-sudo apt install libwebsockets-dev
+sudo apt install libwebsockets-dev libcjson-dev
 make WS=1
 sudo make install
 ```
