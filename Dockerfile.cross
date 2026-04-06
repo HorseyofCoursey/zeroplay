@@ -6,6 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libswresample-dev libswscale-dev \
     libdrm-dev libasound2-dev \
     libfreetype-dev \
+    libcjson-dev \
+    
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
