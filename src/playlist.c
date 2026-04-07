@@ -127,20 +127,38 @@ int playlist_open(Playlist *pl, const char *path, int loop, int shuffle)
     pl->items = calloc(PLAYLIST_MAX_ITEMS, sizeof(PlaylistItem));
     if (!pl->items) { perror("playlist: calloc"); return -1; }
 
-    struct stat st;
-    if (stat(path, &st) < 0) {
-        fprintf(stderr, "playlist: cannot stat '%s'\n", path);
-        free(pl->items);
-        pl->items = NULL;
-        return -1;
-    }
+    /* URLs are passed directly as a single video item — skip stat() */
+    if (strncmp(path, "http://",  7) == 0 ||
+        strncmp(path, "https://", 8) == 0 ||
+        strncmp(path, "rtsp://",  7) == 0 ||
+        strncmp(path, "rtmp://",  7) == 0 ||
+        strncmp(path, "udp://",   6) == 0 ||
+        strncmp(path, "rtp://",   6) == 0) {
+        if (pl->count >= PLAYLIST_MAX_ITEMS) {
+            fprintf(stderr, "playlist: max items reached\n");
+            free(pl->items);
+            pl->items = NULL;
+            return -1;
+        }
+        PlaylistItem *item = &pl->items[pl->count++];
+        strncpy(item->path, path, sizeof(item->path) - 1);
+        item->type = ITEM_VIDEO;
+    } else {
+        struct stat st;
+        if (stat(path, &st) < 0) {
+            fprintf(stderr, "playlist: cannot stat '%s'\n", path);
+            free(pl->items);
+            pl->items = NULL;
+            return -1;
+        }
 
-    if (S_ISDIR(st.st_mode))
-        load_from_dir(pl, path);
-    else if (is_playlist_file(path))
-        load_from_txt(pl, path);
-    else
-        add_item(pl, path);
+        if (S_ISDIR(st.st_mode))
+            load_from_dir(pl, path);
+        else if (is_playlist_file(path))
+            load_from_txt(pl, path);
+        else
+            add_item(pl, path);
+    }
 
     if (pl->count == 0) {
         fprintf(stderr, "playlist: no playable items in '%s'\n", path);
