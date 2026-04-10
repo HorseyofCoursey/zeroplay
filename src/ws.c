@@ -294,7 +294,7 @@ static void ws_send_state(WsContext *ctx)
     WsSharedState *s = ctx->shared_state;
     double pos;
     int paused, idle;
-    char url[2048];
+    char url[WS_COMMAND_URL_SIZE];
 
     pthread_mutex_lock(&s->mutex);
     pos    = s->position_s;

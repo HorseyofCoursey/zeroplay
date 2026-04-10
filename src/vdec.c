@@ -14,6 +14,9 @@
 #include <libavutil/avutil.h>
 #include <libavutil/mathematics.h>
 
+#define VIDEO_AUDIO_DESYNC_THRESHOLD 0.5
+#define VIDEO_AUDIO_DESYNC_EPSILON   0.01
+
 /* ------------------------------------------------------------------ */
 /* Internal helpers                                                     */
 /* ------------------------------------------------------------------ */
@@ -287,6 +290,8 @@ int vdec_open(VdecContext *ctx, AVStream *stream,
     for (int i = 0; i < VDEC_CAPTURE_BUFS; i++)
         ctx->cap_dmabuf_fd[i] = -1;
 
+    ctx->audio_pts     = NULL;
+
     /* Map codec to V4L2 pixel format and select appropriate BSF */
     enum AVCodecID codec_id = stream->codecpar->codec_id;
     uint32_t v4l2_fmt;
@@ -480,6 +485,16 @@ void vdec_run(VdecContext *ctx)
                 if (!out_buf_free[i]) continue;
 
                 void *item = NULL;
+
+                /* If queue is closed free all items */
+                if (ctx->packet_queue->closed) {
+                    while (!queue_pop(ctx->packet_queue, &item)) {
+                        AVPacket *pkt = (AVPacket *)item;
+                        av_packet_free(&pkt);
+                    }
+                    break;
+                }
+
                 if (!queue_pop(ctx->packet_queue, &item)) {
                     eos = 1;
                     break;
@@ -567,6 +582,22 @@ void vdec_run(VdecContext *ctx)
                 frame->sar_den    = ctx->sar_den;
                 frame->pts_us     = (int64_t)buf.timestamp.tv_sec  * 1000000LL
                                   + (int64_t)buf.timestamp.tv_usec;
+
+                /* Block while ahead of audio */
+                if (ctx->audio_pts) {
+                    int64_t video_pts = frame->pts_us;
+
+                    double delta;
+                    int first_iter = 1;
+                    do {
+                        delta = -(*ctx->audio_pts * ctx->audio_time_base - video_pts * ctx->video_time_base);
+
+                        if (first_iter) {
+                            first_iter = 0;
+                            if (delta < VIDEO_AUDIO_DESYNC_THRESHOLD) break;
+                        }
+                    } while (!ctx->packet_queue->closed && (delta > VIDEO_AUDIO_DESYNC_EPSILON));
+                }
 
                 if (!queue_push(ctx->frame_queue, frame)) {
                     free(frame);

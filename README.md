@@ -129,6 +129,9 @@ zeroplay https://example.com/stream.m3u8
 # Play an HLS stream, cap at 2 Mbps (useful on Pi Zero)
 zeroplay --hls-bitrate 2000000 https://example.com/stream.m3u8
 
+# Play video combined from separate video (no audio) and audio HLS streams (like YouTube does)
+zeroplay (https://example.com/stream_video.m3u8)(https://example.com/stream_audio.m3u8)
+
 # Play all media in a directory
 zeroplay /home/pi/media/
 

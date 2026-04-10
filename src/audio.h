@@ -37,6 +37,12 @@ typedef struct {
     volatile int     paused;
     pthread_mutex_t  pause_mutex;
     pthread_cond_t   pause_cond;
+
+    /* Sync with video if separate */
+    volatile int64_t *video_pts;
+    int64_t           audio_pts;
+    double            video_time_base;
+    double            audio_time_base;
 } AudioContext;
 
 int       audio_open(AudioContext *ctx, AVStream *stream,

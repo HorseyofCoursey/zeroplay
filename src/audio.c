@@ -29,6 +29,9 @@
 #  define HAVE_CH_LAYOUT 0
 #endif
 
+#define VIDEO_AUDIO_DESYNC_THRESHOLD 0.5
+#define VIDEO_AUDIO_DESYNC_EPSILON   0.01
+
 static int get_channels(AVCodecParameters *par)
 {
 #if HAVE_CH_LAYOUT
@@ -242,6 +245,9 @@ int audio_open(AudioContext *ctx, AVStream *stream,
     ctx->volume         = 1.0f;
     ctx->muted          = 0;
 
+    ctx->video_pts      = NULL;
+    ctx->audio_pts      = 0;
+
     pthread_mutex_init(&ctx->pause_mutex, NULL);
     pthread_cond_init(&ctx->pause_cond, NULL);
 
@@ -427,13 +433,41 @@ void audio_run(AudioContext *ctx)
             pthread_cond_wait(&ctx->pause_cond, &ctx->pause_mutex);
         pthread_mutex_unlock(&ctx->pause_mutex);
 
-        /* Pull next packet from queue */
         void *item = NULL;
+
+        /* If queue is closed free all items */
+        if (ctx->audio_queue->closed) {
+            while (!queue_pop(ctx->audio_queue, &item)) {
+                AVPacket *pkt = (AVPacket *)item;
+                av_packet_free(&pkt);
+            }
+            break;
+        }
+
+        /* Pull next packet from queue */
         if (!queue_pop(ctx->audio_queue, &item))
             break;       /* queue closed — EOS */
 
         /* Decode the packet.  Note: pkt is local — no leak. */
         AVPacket *pkt = (AVPacket *)item;
+
+        /* Block while ahead of video */
+        if (ctx->video_pts) {
+            int64_t audio_pts = pkt->pts;
+
+            double delta;
+            int first_iter = 1;
+            do {
+                delta = audio_pts * ctx->audio_time_base - *ctx->video_pts * ctx->video_time_base;
+
+                if (first_iter) {
+                    first_iter = 0;
+                    if (delta < VIDEO_AUDIO_DESYNC_THRESHOLD) break;
+                }
+            } while (!ctx->audio_queue->closed && (delta > VIDEO_AUDIO_DESYNC_EPSILON));
+
+            ctx->audio_pts = audio_pts;
+        }
 
         if (avcodec_send_packet(ctx->codec_ctx, pkt) < 0) {
             av_packet_free(&pkt);

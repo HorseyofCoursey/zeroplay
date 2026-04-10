@@ -118,7 +118,7 @@ static void shuffle_items(Playlist *pl)
 /* Public API                                                           */
 /* ------------------------------------------------------------------ */
 
-int playlist_open(Playlist *pl, const char *path, int loop, int shuffle)
+int playlist_open(Playlist *pl, const char *path, const char *path_audio, int loop, int shuffle)
 {
     memset(pl, 0, sizeof(*pl));
     pl->loop    = loop;
@@ -142,6 +142,7 @@ int playlist_open(Playlist *pl, const char *path, int loop, int shuffle)
         }
         PlaylistItem *item = &pl->items[pl->count++];
         strncpy(item->path, path, sizeof(item->path) - 1);
+        strncpy(item->path_audio, path_audio, sizeof(item->path_audio) - 1);
         item->type = ITEM_VIDEO;
     } else {
         struct stat st;

@@ -48,6 +48,11 @@ typedef struct {
     int             cap_dmabuf_fd[VDEC_CAPTURE_BUFS];
 
     int             fmt_negotiated;
+
+    /* Sync with audio if separate */
+    volatile int64_t *audio_pts;
+    double            video_time_base;
+    double            audio_time_base;
 } VdecContext;
 
 int  vdec_open(VdecContext *ctx, AVStream *stream,

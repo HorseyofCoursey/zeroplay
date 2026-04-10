@@ -3,10 +3,13 @@
 
 #include <stdint.h>
 #include <pthread.h>
+#include "playlist.h"
 
 /* ------------------------------------------------------------------ */
 /* Command types (ws_thread → main_thread)                             */
 /* ------------------------------------------------------------------ */
+
+#define WS_COMMAND_URL_SIZE (PLAYLIST_ITEM_PATH_SIZE - 1) * 2 + 4 + 1
 
 typedef enum {
     CMD_NONE = 0,
@@ -19,8 +22,8 @@ typedef enum {
 
 typedef struct {
     CmdType  type;
-    char     url[2048];          /* CMD_LOAD: media URL */
-    int64_t  seek_position_ms;   /* CMD_SEEK: target in milliseconds */
+    char     url[WS_COMMAND_URL_SIZE];    /* CMD_LOAD: media URL */
+    int64_t  seek_position_ms;            /* CMD_SEEK: target in milliseconds */
 } WsCommand;
 
 /* ------------------------------------------------------------------ */
@@ -48,11 +51,11 @@ void ws_cmd_queue_destroy(WsCmdQueue *q);
 
 typedef struct {
     pthread_mutex_t mutex;
-    double          position_s;     /* playback position in seconds, -1 if unknown */
+    double          position_s;                    /* playback position in seconds, -1 if unknown */
     int             paused;
-    char            url[2048];      /* currently loaded URL, "" if idle */
-    int             idle;           /* 1 when no media is loaded */
-    int             player_ready;   /* 1 when V4L2 pipeline is initialized */
+    char            url[WS_COMMAND_URL_SIZE];      /* currently loaded URL, "" if idle */
+    int             idle;                          /* 1 when no media is loaded */
+    int             player_ready;                  /* 1 when V4L2 pipeline is initialized */
 } WsSharedState;
 
 void ws_shared_state_init(WsSharedState *s);

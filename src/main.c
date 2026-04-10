@@ -179,6 +179,32 @@ static int parse_args(int argc, char *argv[], Options *opt)
     return 0;
 }
 
+/* Parse URL of type: "(video_url)(audio_url)" */
+static void parse_separated_video_audio_url(const char *url, char *url_video, char *url_audio)
+{
+    if (url[0] != '(') {
+        strncpy(url_video, url, PLAYLIST_ITEM_PATH_SIZE - 1);
+        url_audio[0] = '\0';
+        return;
+    }
+
+    const char *url_video_open = url;
+    const char *url_video_close = strchr(url, ')');
+    if (!url_video_close) return;
+
+    const char *url_audio_open = url_video_close + 1;
+    const char *url_audio_close = strrchr(url, ')');
+    if (url_audio_close == url_video_close) return;
+
+    const size_t url_video_size = url_video_close - url_video_open - 1;
+    strncpy(url_video, url_video_open + 1, url_video_size);
+    url_video[url_video_size] = '\0';
+
+    const size_t url_audio_size = url_audio_close - url_video_close - 2;
+    strncpy(url_audio, url_audio_open + 1, url_audio_size);
+    url_audio[url_audio_size] = '\0';
+}
+
 static struct termios orig_termios;
 
 static void term_restore(void)
@@ -272,12 +298,13 @@ static int find_srt_alongside(const char *video_path,
 typedef struct {
     Playlist     playlist;
     DemuxContext demux;
+    DemuxContext demux_audio; /* Separate demuxer for audio only to be able to combine separate video and audio inputs */
     VdecContext  vdec;
     AudioContext audio;
     Queue        video_queue;
     Queue        audio_queue;
     Queue        frame_queue;
-    pthread_t    dtid, vtid, atid;
+    pthread_t    dtid, datid, vtid, atid;
     int          pipeline_open;
     int          audio_active;
 
@@ -300,6 +327,7 @@ typedef struct {
 
     int          output_idx;
     int          no_audio;
+    int          separate_audio;
     int64_t      image_duration_us;
     int64_t      duration_us;
     DrmContext  *drm_ctx;      /* for subtitle overlay */
@@ -311,6 +339,11 @@ static void *demux_thread(void *arg)
 {
     PlayerContext *p = ((ThreadArg *)arg)->p; free(arg);
     demux_run(&p->demux); return NULL;
+}
+static void *demux_audio_thread(void *arg)
+{
+    PlayerContext *p = ((ThreadArg *)arg)->p; free(arg);
+    demux_run(&p->demux_audio); return NULL;
 }
 static void *vdec_thread(void *arg)
 {
@@ -331,8 +364,12 @@ static void *subtitle_thread(void *arg)
 static void player_threads_start(PlayerContext *p)
 {
     ThreadArg *da = malloc(sizeof(*da)); da->p = p;
-    ThreadArg *va = malloc(sizeof(*va)); va->p = p;
     pthread_create(&p->dtid, NULL, demux_thread, da);
+    if (p->audio_active && p->separate_audio) {
+        ThreadArg *daa = malloc(sizeof(*daa)); daa->p = p;
+        pthread_create(&p->datid, NULL, demux_audio_thread, daa);
+    }
+    ThreadArg *va = malloc(sizeof(*va)); va->p = p;
     pthread_create(&p->vtid, NULL, vdec_thread,  va);
     if (p->audio_active) {
         ThreadArg *aa = malloc(sizeof(*aa)); aa->p = p;
@@ -349,9 +386,12 @@ static void player_threads_stop(PlayerContext *p)
     queue_close(&p->video_queue);
     queue_close(&p->audio_queue);
     queue_close(&p->frame_queue);
+
     if (p->sub_active && p->sub_embedded)
         queue_close(&p->sub_queue);
     pthread_join(p->dtid, NULL);
+    if (p->audio_active && p->separate_audio)
+        pthread_join(p->datid, NULL);
     pthread_join(p->vtid, NULL);
     if (p->audio_active)
         pthread_join(p->atid, NULL);
@@ -404,6 +444,8 @@ static void player_close_pipeline(PlayerContext *p)
     }
     vdec_close(&p->vdec);
     demux_close(&p->demux);
+    if (p->audio_active && p->separate_audio)
+        demux_close(&p->demux_audio);
     queue_destroy(&p->video_queue);
     queue_destroy(&p->audio_queue);
     queue_destroy(&p->frame_queue);
@@ -416,19 +458,27 @@ static void player_close_pipeline(PlayerContext *p)
     p->eos           = 0;
 }
 
-static int player_open_video(PlayerContext *p, const char *filename,
+static int player_open_video(PlayerContext *p, const char *filename, const char *filename_audio,
                               const Options *opt)
 {
+    p->separate_audio = filename_audio[0] != '\0';
+
     queue_init(&p->video_queue);
     queue_init(&p->audio_queue);
     queue_init_size(&p->frame_queue, FRAME_QUEUE_SIZE);
 
     if (demux_open(&p->demux, filename, &p->video_queue, &p->audio_queue,
-                   opt->hls_max_bandwidth) < 0)
+                   opt->hls_max_bandwidth, 0) < 0)
         return -1;
 
-    if (p->no_audio)
+    if (!p->no_audio && p->separate_audio)
+        if (demux_open(&p->demux_audio, filename_audio, &p->video_queue, &p->audio_queue,
+                    opt->hls_max_bandwidth, 1) < 0)
+            return -1;
+
+    if (p->no_audio) {
         p->demux.audio_stream_idx = -1;
+    }
 
     AVStream *video_stream =
         p->demux.fmt_ctx->streams[p->demux.video_stream_idx];
@@ -437,13 +487,31 @@ static int player_open_video(PlayerContext *p, const char *filename,
         return -1;
 
     p->audio_active = 0;
-    if (!p->no_audio && p->demux.audio_stream_idx >= 0) {
-        AVStream *audio_stream =
-            p->demux.fmt_ctx->streams[p->demux.audio_stream_idx];
-        if (audio_open(&p->audio, audio_stream, opt->audio_device,
-                       &p->audio_queue) == 0) {
+    if (!p->no_audio) {
+        AVStream *audio_stream = NULL;
+        if (p->separate_audio && p->demux_audio.audio_stream_idx >= 0) {
+            audio_stream =
+                p->demux_audio.fmt_ctx->streams[p->demux_audio.audio_stream_idx];
+        } else if (p->demux.audio_stream_idx >= 0) {
+            audio_stream =
+                p->demux.fmt_ctx->streams[p->demux.audio_stream_idx];
+        }
+
+        if (audio_stream && (audio_open(&p->audio, audio_stream, opt->audio_device,
+                        &p->audio_queue) == 0)) {
             p->audio.volume = opt->vol / 100.0f;
             p->audio_active = 1;
+
+            if (p->separate_audio)
+            {
+                p->vdec.audio_pts = &p->audio.audio_pts;
+                p->vdec.video_time_base = 1.0 / 1000000LL;
+                p->vdec.audio_time_base = av_q2d(p->demux_audio.fmt_ctx->streams[p->demux_audio.audio_stream_idx]->time_base);
+
+                p->audio.video_pts = &p->current_pts;
+                p->audio.video_time_base = 1.0 / 1000000LL;
+                p->audio.audio_time_base = av_q2d(p->demux_audio.fmt_ctx->streams[p->demux_audio.audio_stream_idx]->time_base);
+            }
         }
     }
 
@@ -454,6 +522,8 @@ static int player_open_video(PlayerContext *p, const char *filename,
         int64_t start_us = (int64_t)(opt->start_pos * 1000000.0);
         if (start_us > p->duration_us) start_us = p->duration_us;
         demux_seek(&p->demux, start_us);
+        if (p->audio_active && p->separate_audio)
+            demux_seek(&p->demux_audio, start_us);
         p->current_pts = start_us;
     }
 
@@ -502,6 +572,8 @@ static void player_seek(PlayerContext *p, int64_t target_us)
 
     player_threads_stop(p);
     demux_seek(&p->demux, target_us);
+    if (p->audio_active && p->separate_audio)
+        demux_seek(&p->demux_audio, target_us);
     vdec_flush(&p->vdec);
     if (p->audio_active) audio_flush(&p->audio);
     if (p->sub_active)   subtitle_flush(&p->sub);
@@ -547,29 +619,30 @@ static int player_advance_to_next(PlayerContext *p, DrmContext *drm,
         player_close_pipeline(p);
         p->image_mode = 0;
 
-        if (player_open_video(p, item->path, opt) < 0) {
-            fprintf(stderr, "zeroplay[%d]: failed to open '%s', skipping\n",
-                    p->output_idx, item->path);
+        if (player_open_video(p, item->path, item->path_audio, opt) < 0) {
+            fprintf(stderr, "zeroplay[%d]: failed to open '%s' '%s', skipping\n",
+                    p->output_idx, item->path, item->path_audio);
             return player_advance_to_next(p, drm, opt);
         }
-        fprintf(stderr, "zeroplay[%d]: playing '%s'\n",
-                p->output_idx, basename(item->path));
+        fprintf(stderr, "zeroplay[%d]: playing '%s' '%s'\n",
+                p->output_idx, basename(item->path), basename(item->path_audio));
         player_threads_start(p);
     }
 
     return 0;
 }
 
-static int player_open(PlayerContext *p, const char *path,
+static int player_open(PlayerContext *p, const char *path, const char *path_audio,
                         const Options *opt, int output_idx, DrmContext *drm)
 {
     memset(p, 0, sizeof(*p));
     p->output_idx        = output_idx;
     p->no_audio          = opt->no_audio || (output_idx != 0);
+    p->separate_audio    = 0;
     p->image_duration_us = (int64_t)(opt->image_duration_s * 1000000.0);
     p->drm_ctx           = drm;
 
-    if (playlist_open(&p->playlist, path, opt->loop, opt->shuffle) < 0)
+    if (playlist_open(&p->playlist, path, path_audio, opt->loop, opt->shuffle) < 0)
         return -1;
 
     PlaylistItem *item = playlist_current(&p->playlist);
@@ -594,12 +667,12 @@ static int player_open(PlayerContext *p, const char *path,
                 output_idx, item->path,
                 (double)p->image_duration_us / 1e6);
     } else {
-        if (player_open_video(p, item->path, opt) < 0) {
+        if (player_open_video(p, item->path, item->path_audio, opt) < 0) {
             playlist_close(&p->playlist);
             return -1;
         }
-        fprintf(stderr, "zeroplay[%d]: playing '%s'\n",
-                output_idx, basename(item->path));
+        fprintf(stderr, "zeroplay[%d]: playing '%s' '%s'\n",
+                output_idx, basename(item->path), basename(item->path_audio));
     }
 
     return 0;
@@ -634,7 +707,7 @@ static void player_go_to_prev(PlayerContext *p, DrmContext *drm,
         fprintf(stderr, "zeroplay[%d]: showing '%s'\n",
                 p->output_idx, basename(item->path));
     } else {
-        if (player_open_video(p, item->path, opt) == 0)
+        if (player_open_video(p, item->path, item->path_audio, opt) == 0)
             player_threads_start(p);
     }
 }
@@ -706,7 +779,12 @@ static int run_ws_mode(Options *opt)
                 player_close_pipeline(&player);
                 paused = 0;
                 audio_started = 0;
-                if (player_open_video(&player, cmd.url, opt) < 0) {
+
+                char path[PLAYLIST_ITEM_PATH_SIZE];
+                char path_audio[PLAYLIST_ITEM_PATH_SIZE];
+                parse_separated_video_audio_url(cmd.url, path, path_audio);
+
+                if (player_open_video(&player, path, path_audio, opt) < 0) {
                     fprintf(stderr, "zeroplay: failed to open %s\n", cmd.url);
                     ws_shared_state_set_idle(&shared, 1);
                     ws_shared_state_set_url(&shared, NULL);
@@ -879,7 +957,11 @@ int main(int argc, char *argv[])
     PlayerContext players[MAX_FILES];
     int opened = 0;
     for (int i = 0; i < player_count; i++) {
-        if (player_open(&players[i], opt.paths[i], &opt, i, &drm) < 0) {
+        char path[PLAYLIST_ITEM_PATH_SIZE];
+        char path_audio[PLAYLIST_ITEM_PATH_SIZE];
+        parse_separated_video_audio_url(opt.paths[i], path, path_audio);
+
+        if (player_open(&players[i], path, path_audio, &opt, i, &drm) < 0) {
             fprintf(stderr, "zeroplay: failed to open '%s'\n", opt.paths[i]);
             for (int j = 0; j < opened; j++) player_shutdown(&players[j]);
             drm_close(&drm);
@@ -979,7 +1061,10 @@ int main(int argc, char *argv[])
                     : demux_prev_chapter(&players[i].demux,
                                          players[i].current_pts, &target);
                 if (found == 0) {
-                    int was_paused = paused; paused = 0;
+                    int was_paused = paused;
+                    paused = 0;
+                    if (was_paused)
+                        audio_resume(&players[i].audio);
                     player_seek(&players[i], target);
                     players[i].current_pts = target;
                     if (was_paused) {
@@ -999,7 +1084,11 @@ int main(int argc, char *argv[])
             else if (key == KEY_UP)    delta = +SEEK_LONG_US;
             else if (key == KEY_DOWN)  delta = -SEEK_LONG_US;
 
-            int was_paused = paused; paused = 0;
+            int was_paused = paused;
+            paused = 0;
+            if (was_paused)
+                for (int i = 0; i < opened; i++)
+                    audio_resume(&players[i].audio);
             for (int i = 0; i < opened; i++) {
                 if (players[i].image_mode || !players[i].pipeline_open) continue;
                 int64_t target = players[i].current_pts + delta;

@@ -162,6 +162,16 @@ void subtitle_run(SubtitleContext *ctx)
 
     while (1) {
         void *item = NULL;
+
+        /* If queue is closed free all items */
+        if (ctx->subtitle_queue->closed) {
+            while (!queue_pop(ctx->subtitle_queue, &item)) {
+                AVPacket *pkt = (AVPacket *)item;
+                av_packet_free(&pkt);
+            }
+            break;
+        }
+
         if (!queue_pop(ctx->subtitle_queue, &item))
             break;  /* queue closed — EOS */
 

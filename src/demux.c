@@ -6,7 +6,7 @@
 
 int demux_open(DemuxContext *ctx, const char *filename,
                Queue *video_queue, Queue *audio_queue,
-               int64_t hls_max_bandwidth)
+               int64_t hls_max_bandwidth, int separate_audio)
 {
     ctx->fmt_ctx             = NULL;
     ctx->video_stream_idx    = -1;
@@ -72,36 +72,53 @@ int demux_open(DemuxContext *ctx, const char *filename,
             ctx->subtitle_stream_idx = (int)i;
     }
 
-    /* Fallback: if no H.264 stream found, take the first video stream
-     * so we at least report the codec to the user. */
-    if (ctx->video_stream_idx == -1) {
-        for (unsigned int i = 0; i < ctx->fmt_ctx->nb_streams; i++) {
-            AVCodecParameters *par = ctx->fmt_ctx->streams[i]->codecpar;
-            if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
-                ctx->video_stream_idx = (int)i;
-                fprintf(stderr, "demux: WARNING — no H.264 stream found, "
-                        "selected %s (may not decode on V4L2 M2M)\n",
-                        avcodec_get_name(par->codec_id));
-                break;
+    if (separate_audio) {
+        if (ctx->audio_stream_idx == -1) {
+            fprintf(stderr, "demux: no audio stream found\n");
+            return -1;
+        }
+        if (ctx->video_stream_idx != -1) {
+            fprintf(stderr, "demux: duplicate video stream found\n");
+            return -1;
+        }
+        if (ctx->subtitle_stream_idx != -1) {
+            fprintf(stderr, "demux: duplicate subtitle stream found\n");
+            return -1;
+        }
+    } else {
+        /* Fallback: if no H.264 stream found, take the first video stream
+        * so we at least report the codec to the user. */
+        if (ctx->video_stream_idx == -1) {
+            for (unsigned int i = 0; i < ctx->fmt_ctx->nb_streams; i++) {
+                AVCodecParameters *par = ctx->fmt_ctx->streams[i]->codecpar;
+                if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    ctx->video_stream_idx = (int)i;
+                    fprintf(stderr, "demux: WARNING — no H.264 stream found, "
+                            "selected %s (may not decode on V4L2 M2M)\n",
+                            avcodec_get_name(par->codec_id));
+                    break;
+                }
             }
         }
-    }
 
-    if (ctx->video_stream_idx == -1) {
-        fprintf(stderr, "demux: no video stream found\n");
-        return -1;
+        if (ctx->video_stream_idx == -1) {
+            fprintf(stderr, "demux: no video stream found\n");
+            return -1;
+        }
     }
 
     /* Duration in microseconds */
     if (ctx->fmt_ctx->duration != AV_NOPTS_VALUE)
         ctx->duration_us = ctx->fmt_ctx->duration;   /* AV_TIME_BASE = 1us */
 
-    AVStream *vs = ctx->fmt_ctx->streams[ctx->video_stream_idx];
-    vlog("demux: video stream %d — %s %dx%d @ %d/%d fps\n",
-            ctx->video_stream_idx,
-            avcodec_get_name(vs->codecpar->codec_id),
-            vs->codecpar->width, vs->codecpar->height,
-            vs->avg_frame_rate.num, vs->avg_frame_rate.den);
+    if (ctx->video_stream_idx >= 0) {
+        AVStream *vs = ctx->fmt_ctx->streams[ctx->video_stream_idx];
+        vlog("demux: video stream %d — %s %dx%d @ %d/%d fps\n",
+                ctx->video_stream_idx,
+                avcodec_get_name(vs->codecpar->codec_id),
+                vs->codecpar->width, vs->codecpar->height,
+                vs->avg_frame_rate.num, vs->avg_frame_rate.den);
+    }
 
     if (ctx->audio_stream_idx >= 0) {
         AVStream *as = ctx->fmt_ctx->streams[ctx->audio_stream_idx];
@@ -180,7 +197,8 @@ void demux_run(DemuxContext *ctx)
 
     av_packet_free(&pkt);
 done:
-    queue_close(ctx->video_queue);
+    if (ctx->video_stream_idx >= 0)
+        queue_close(ctx->video_queue);
     if (ctx->audio_stream_idx >= 0)
         queue_close(ctx->audio_queue);
     if (ctx->subtitle_stream_idx >= 0 && ctx->subtitle_queue)
