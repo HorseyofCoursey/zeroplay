@@ -148,6 +148,18 @@ zeroplay movie.mp4
 # Play with an explicit subtitle file
 zeroplay --sub subtitles.srt movie.mp4
 
+# Play all media in a directory
+zeroplay /home/pi/media/
+
+# Play a playlist file, loop and shuffle
+zeroplay --loop --shuffle playlist.txt
+
+# Mix images and videos in a directory, 15 seconds per image
+zeroplay --loop --image-duration 15 /home/pi/media/
+
+# Display a static image indefinitely
+zeroplay --image-duration 0 photo.jpg
+
 # Loop a directory of media
 zeroplay --loop /home/pi/media/
 
