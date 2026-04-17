@@ -1,6 +1,6 @@
 # ZeroPlay
 
-A lightweight H.264 video player for the Raspberry Pi, built as a modern replacement for the discontinued omxplayer. Uses the V4L2 M2M hardware decoder, DRM/KMS display, and ALSA audio — zero CPU video decode, zero X11 dependency.
+A lightweight H.264 video player for Linux SBCs, built as a modern replacement for the discontinued omxplayer. Uses the V4L2 M2M hardware decoder, DRM/KMS display, and ALSA audio — zero CPU video decode, zero X11 dependency.
 
 have a nice day ;)
 
@@ -8,16 +8,15 @@ have a nice day ;)
 
 ## Supported Hardware
 
+ZeroPlay runs on any Linux device with a V4L2 M2M hardware decoder and DRM/KMS display. Tested on:
+
 | Device | OS |
 |---|---|
-| Pi Zero W (original) | Raspberry Pi OS Lite 32-bit (Trixie) |
-| Pi Zero 2 W | Raspberry Pi OS Lite 64-bit (Trixie) |
-| Pi Zero 2 W | Raspberry Pi OS Lite 32-bit (Trixie) |
+| Pi Zero W | Raspberry Pi OS Lite 32-bit (Trixie) |
+| Pi Zero 2 W | Raspberry Pi OS Lite 32/64-bit (Trixie) |
 | Pi Zero 2 W | balenaOS (Bookworm) |
-| Pi 3 / 3+ | Raspberry Pi OS Lite 64-bit (Trixie) |
-| Pi 3 / 3+ | Raspberry Pi OS Lite 32-bit (Trixie) |
-| Pi 4 | Raspberry Pi OS Lite 64-bit (Trixie) |
-| Pi 4 | Raspberry Pi OS Lite 32-bit (Trixie) |
+| Pi 3 / 3+ | Raspberry Pi OS Lite 32/64-bit (Trixie) |
+| Pi 4 | Raspberry Pi OS Lite 32/64-bit (Trixie) |
 
 Both 32-bit and 64-bit builds are supported. The install script builds from source automatically for the correct architecture.
 
@@ -43,10 +42,6 @@ H.264 is hardware decoded via the bcm2835 VPU on Pi Zero W, Pi Zero 2W, and Pi 3
 | FLAC | |
 | Opus | |
 
-### Streaming
-
-ZeroPlay supports HLS streams (`.m3u8`) directly — pass a URL as the path argument. Use `--hls-bitrate` to cap the variant bitrate on bandwidth-limited connections.
-
 ---
 
 ## Installation
@@ -55,14 +50,14 @@ ZeroPlay supports HLS streams (`.m3u8`) directly — pass a URL as the path argu
 curl -fsSL https://raw.githubusercontent.com/HorseyofCoursey/zeroplay/main/install.sh | sudo bash
 ```
 
-This will install dependencies, build from source, and place the binary at `/usr/local/bin/zeroplay`.
+This installs dependencies, builds from source, and places the binary at `/usr/local/bin/zeroplay`.
 
 ### Manual build
 
 ```bash
 sudo apt install git gcc make pkgconf \
   libavformat-dev libavcodec-dev libavutil-dev libswresample-dev libswscale-dev \
-  libdrm-dev libasound2-dev
+  libdrm-dev libasound2-dev libcjson-dev libfreetype-dev
 
 git clone https://github.com/HorseyofCoursey/zeroplay.git
 cd zeroplay
@@ -70,27 +65,34 @@ make
 sudo make install
 ```
 
-### Cross-compile from x86 Linux
+`libfreetype-dev` is optional but recommended — without it subtitles use a built-in bitmap font fallback.
 
-If you'd rather build on your desktop/laptop instead of the Pi:
+### YouTube support (optional)
+
+To play YouTube URLs directly, install yt-dlp:
+
+```bash
+sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+  -o /usr/local/bin/yt-dlp && sudo chmod +x /usr/local/bin/yt-dlp
+```
+
+Keep yt-dlp up to date — YouTube changes frequently and old versions stop working.
+
+### WebSocket remote control (optional)
+
+```bash
+sudo apt install libwebsockets-dev
+make WS=1
+sudo make install
+```
+
+### Cross-compile from x86 Linux
 
 ```bash
 ./cross-build.sh
 ```
 
-This uses Docker with QEMU emulation to build a native aarch64 binary. Requires Docker with buildx. The resulting `zeroplay` binary can be copied to the Pi with `scp`.
-
-### WebSocket remote control (optional)
-
-To build with WebSocket remote control support:
-
-```bash
-sudo apt install libwebsockets-dev libcjson-dev
-make WS=1
-sudo make install
-```
-
-The base build has no dependency on libwebsockets. See [WebSocket mode](#websocket-remote-control) below.
+Uses Docker with buildx to produce a native ARM binary. Copy the result to your Pi with `scp`.
 
 ---
 
@@ -100,7 +102,7 @@ The base build has no dependency on libwebsockets. See [WebSocket mode](#websock
 zeroplay [options] <path> [path2 ...]
 ```
 
-Each path can be a video file, an image, a `.txt`/`.m3u` playlist, a directory, or an HLS URL. Up to 4 paths may be given — each is assigned to a connected display in DRM enumeration order. On Pi 4 with two HDMI outputs connected, `zeroplay file1.mp4 file2.mp4` plays each file on a separate display simultaneously.
+Each path can be a video file, image, `.txt`/`.m3u` playlist, directory, URL, or YouTube URL. Up to 4 paths may be given — each is assigned to a connected display in DRM enumeration order.
 
 ### Options
 
@@ -112,71 +114,63 @@ Each path can be a video file, an image, a `.txt`/`.m3u` playlist, a directory, 
 | `--vol n` | Initial volume, 0–200 (default: 100) |
 | `--pos n` | Start position in seconds |
 | `--audio-device dev` | ALSA device override |
+| `--sub path` | External subtitle file (.srt) |
 | `--hls-bitrate bps` | Cap HLS variant bitrate in bps (or `HLS_MAX_BANDWIDTH` env) |
-| `--image-duration n` | Seconds to display each image (default: 10, 0 = hold forever) |
-| `--verbose` | Print decoder and driver info on startup |
+| `--yt-quality n` | YouTube stream height: 360, 480, 720, 1080 (default: 480) |
+| `--image-duration n` | Seconds per image (default: 10, 0 = hold forever) |
+| `--verbose` | Print decoder and driver info |
 | `--help` | Show usage |
 
 ### Examples
 
 ```bash
-# Play a file
+# Play a local file
 zeroplay movie.mp4
+
+# Play a YouTube video (requires yt-dlp)
+zeroplay "https://www.youtube.com/watch?v=..."
+
+# Play YouTube at 720p (Pi 4/5)
+zeroplay --yt-quality 720 "https://www.youtube.com/watch?v=..."
+
+# Play YouTube at 360p (Pi Zero W)
+zeroplay --yt-quality 360 "https://www.youtube.com/watch?v=..."
 
 # Play an HLS stream
 zeroplay https://example.com/stream.m3u8
 
-# Play an HLS stream, cap at 2 Mbps (useful on Pi Zero)
-zeroplay --hls-bitrate 2000000 https://example.com/stream.m3u8
+# Play separate video and audio streams (advanced)
+zeroplay "(https://example.com/video.m3u8)(https://example.com/audio.m3u8)"
 
-# Play video combined from separate video (no audio) and audio HLS streams (like YouTube does)
-zeroplay (https://example.com/stream_video.m3u8)(https://example.com/stream_audio.m3u8)
+# Play with subtitles (auto-detected if .srt has the same name as the video)
+zeroplay movie.mp4
 
-# Play all media in a directory
-zeroplay /home/pi/media/
+# Play with an explicit subtitle file
+zeroplay --sub subtitles.srt movie.mp4
 
-# Play a playlist file, loop and shuffle
+# Loop a directory of media
+zeroplay --loop /home/pi/media/
+
+# Shuffle a playlist
 zeroplay --loop --shuffle playlist.txt
-
-# Mix images and videos in a directory, 15 seconds per image
-zeroplay --loop --image-duration 15 /home/pi/media/
-
-# Display a static image indefinitely
-zeroplay --image-duration 0 photo.jpg
 
 # Dual display on Pi 4
 zeroplay file1.mp4 file2.mp4
 
-# Dual display with playlists, each display independent
-zeroplay /media/screen1/ /media/screen2/
-
 # Start at 1h 30min
 zeroplay --pos 5400 movie.mp4
-
-# Start at 80% volume
-zeroplay --vol 80 movie.mp4
-
-# No audio
-zeroplay --no-audio movie.mp4
-
-# Override ALSA output device
-zeroplay --audio-device plughw:CARD=Headphones,DEV=0 movie.mp4
-
-# Show decoder and driver details on startup
-zeroplay --verbose movie.mp4
 ```
 
 ---
 
 ## Playlist files
 
-A playlist is a plain `.txt` or `.m3u` file with one path per line. Lines starting with `#` are ignored.
+A plain `.txt` or `.m3u` file with one path or URL per line. Lines starting with `#` are ignored.
 
 ```
 # My playlist
 /home/pi/media/intro.mp4
 /home/pi/media/photo.jpg
-/home/pi/media/main.mp4
 https://example.com/stream.m3u8
 ```
 
@@ -192,29 +186,58 @@ https://example.com/stream.m3u8
 | `+` / `=` | Volume up 10% |
 | `-` | Volume down 10% |
 | `m` | Mute / unmute |
-| `n` | Skip to next playlist item |
-| `b` | Go to previous playlist item |
-| `i` | Previous chapter |
-| `o` | Next chapter |
+| `n` | Next playlist item |
+| `b` | Previous playlist item |
+| `i` / `o` | Previous / next chapter |
 | `q` / Esc | Quit |
+
+---
+
+## Subtitles
+
+ZeroPlay renders subtitles via a DRM overlay plane — composited by the display hardware with no CPU overhead.
+
+- **Auto-detection** — a `.srt` file with the same name as the video is loaded automatically
+- **Explicit file** — use `--sub subtitles.srt`
+- **Embedded** — MKV files with embedded SRT/subrip subtitle tracks work automatically
+- **Font** — DejaVu Sans Bold 36px when `libfreetype-dev` is installed; built-in bitmap font otherwise
+
+---
+
+## YouTube
+
+ZeroPlay detects YouTube URLs automatically and resolves them via yt-dlp:
+
+```bash
+zeroplay "https://www.youtube.com/watch?v=..."
+zeroplay "https://youtu.be/..."
+zeroplay "https://www.youtube.com/shorts/..."
+```
+
+Use `--yt-quality` to set the maximum stream height. The default is 480p which works well on Pi Zero 2W. Pi 4/5 users can use 720p or 1080p.
+
+| Device | Recommended quality |
+|---|---|
+| Pi Zero W | 360p |
+| Pi Zero 2 W | 480p |
+| Pi 3 | 480p |
+| Pi 4 / 5 | 720p or 1080p |
+
+> **Note:** Rapid seeking and pausing during YouTube playback may cause instability due to the dual-stream sync mechanism. Normal playback and occasional seeking works reliably.
 
 ---
 
 ## Audio
 
-ZeroPlay auto-detects the HDMI audio device and routes through the `hdmi:` ALSA device, which uses the IEC958 plugin chain built into vc4-hdmi. This ensures correct HDMI audio on all supported Pi models — using `plughw:` directly bypasses this chain and produces noise.
+ZeroPlay auto-detects the HDMI audio device and routes through the `hdmi:` ALSA device, which uses the IEC958 plugin chain built into vc4-hdmi. Using `plughw:` directly bypasses this chain and produces noise.
 
-The hardware's native sample rate is probed at startup so that libswresample performs any necessary conversion correctly, avoiding pitch distortion.
-
-To override the audio device:
+The hardware's native sample rate is probed at startup to avoid pitch distortion from resampling.
 
 ```bash
+# Override the audio device
 zeroplay --audio-device plughw:CARD=Headphones,DEV=0 movie.mp4
-```
 
-To list available devices:
-
-```bash
+# List available devices
 aplay -L
 ```
 
@@ -222,47 +245,37 @@ aplay -L
 
 ## WebSocket Remote Control
 
-> Requires building with `make WS=1`. The base binary has no dependency on libwebsockets.
+> Requires `make WS=1`. No libwebsockets dependency in the base build.
 
-When built with WebSocket support, ZeroPlay can run as a remotely controlled player, receiving commands from a backend and reporting state every 5 seconds.
+Runs ZeroPlay as a remotely controlled player, receiving commands from a backend and reporting state every 5 seconds.
 
 ```bash
 zeroplay --ws-url ws://backend.local:8080/ws --device-token <token>
 ```
 
-In WebSocket mode, no file path is required on the command line — media is loaded via `load` commands from the backend.
-
-### WebSocket options
+### Options
 
 | Flag | Env var | Description |
 |---|---|---|
 | `--ws-url URL` | `BACKEND_WS_URL` | Backend WebSocket URL (`ws://` or `wss://`) |
-| `--device-token TOKEN` | `DEVICE_TOKEN` | Device authentication token (required) |
+| `--device-token TOKEN` | `DEVICE_TOKEN` | Device auth token (required) |
 | `--health-port PORT` | `HEALTH_PORT` | HTTP health endpoint port (default: 3000) |
 
-### Commands (backend → device)
+### Commands
 
 | Command | Fields | Description |
 |---|---|---|
 | `load` | `url` | Load and play a media URL |
-| `play` | — | Resume playback |
-| `pause` | — | Pause playback |
+| `play` | — | Resume |
+| `pause` | — | Pause |
 | `stop` | — | Stop and unload |
 | `seek` | `positionMs` | Seek to position in milliseconds |
 
-### State reports (device → backend)
-
-Every 5 seconds the device sends a `state` message with current position, pause state, loaded URL, and idle flag. The `/health` endpoint returns a JSON response indicating WebSocket connection and player readiness.
-
-### Reconnection
-
-ZeroPlay reconnects automatically on disconnect with exponential backoff (1s → 30s).
+Reconnects automatically with exponential backoff (1s → 30s).
 
 ---
 
 ## Running as a service
-
-### Standalone mode
 
 ```bash
 sudo nano /etc/systemd/system/zeroplay.service
@@ -285,36 +298,9 @@ RestartSec=3
 WantedBy=multi-user.target
 ```
 
-### WebSocket mode
-
-```ini
-[Unit]
-Description=ZeroPlay video player (WebSocket mode)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=pi
-Group=video
-Environment=HOME=/home/pi
-Environment=BACKEND_WS_URL=ws://backend.local:8080/ws
-Environment=DEVICE_TOKEN=your-token-here
-ExecStart=/usr/local/bin/zeroplay --ws-url ${BACKEND_WS_URL} --device-token ${DEVICE_TOKEN}
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now zeroplay
-```
-
-Make sure your user is in the video group:
-
-```bash
 sudo usermod -aG video pi
 ```
 
@@ -322,13 +308,14 @@ sudo usermod -aG video pi
 
 ## How It Works
 
-- **Demux** — libavformat reads the container and routes packets (supports local files, HLS, and other network streams)
-- **Video decode** — V4L2 M2M hardware decoder via bcm2835-codec
+- **Demux** — libavformat reads the container and routes packets (local files, HLS, network streams, YouTube via yt-dlp)
+- **Video decode** — V4L2 M2M hardware decoder
 - **Display** — DRM/KMS atomic modesetting with DMABUF zero-copy from decoder to scanout
-- **Audio** — libavcodec software decode → libswresample (with hardware rate probing and HE-AAC SBR correction) → ALSA
-- **Sync** — Wall-clock pacing against video PTS, audio runs independently
+- **Subtitles** — rendered into an ARGB8888 DRM overlay plane, composited by the display hardware
+- **Audio** — libavcodec → libswresample (hardware rate probing, HE-AAC SBR correction) → ALSA
+- **Sync** — wall-clock pacing against video PTS; A/V sync throttling for separate stream playback
 
-No X11, no Wayland, no GPU compositing. Runs directly on the framebuffer from a TTY or SSH session.
+No X11, no Wayland, no GPU compositing. Runs from a TTY or SSH session.
 
 ---
 
@@ -342,9 +329,11 @@ No X11, no Wayland, no GPU compositing. Runs directly on the framebuffer from a 
 | Playlist / directory | No | Yes |
 | Image display | No | Yes |
 | HLS streaming | No | Yes |
+| YouTube | No | Yes (via yt-dlp) |
+| Subtitles (SRT) | Yes | Yes |
+| Subtitles (embedded MKV) | No | Yes |
 | WebSocket remote control | No | Yes (opt-in) |
-| Subtitles | Yes | Yes |
-| Chapter skip | No | Yes |
+| Chapter navigation | No | Yes |
 | Seeking | Yes | Yes |
 | Volume control | Yes | Yes |
 | Loop | Yes | Yes |
