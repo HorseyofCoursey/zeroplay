@@ -28,10 +28,16 @@ typedef struct {
  *   - a directory   (flat scan, alphabetical)
  *   - a .txt/.m3u   (one path per line, # = comment)
  *   - a single file (treated as a one-item playlist)
+ *   - a URL         (http/https/rtsp/rtmp/udp/rtp passed directly)
+ *   - a YouTube URL (resolved via yt-dlp automatically)
+ *
+ * yt_quality caps YouTube stream height (e.g. 480, 720, 1080).
+ * Pass 0 to use the default (480p).
  *
  * Returns 0 on success, -1 on error.
  */
-int           playlist_open(Playlist *pl, const char *path, const char *path_audio, int loop, int shuffle);
+int           playlist_open(Playlist *pl, const char *path, const char *path_audio,
+                             int loop, int shuffle, int yt_quality);
 void          playlist_close(Playlist *pl);
 
 /* Returns pointer to current item, or NULL if empty. */
@@ -40,7 +46,6 @@ PlaylistItem *playlist_current(Playlist *pl);
 /*
  * Advance to next item.
  * Returns 0 on success, -1 if the playlist is exhausted and loop=false.
- * If loop=true, wraps around to the beginning and returns 0.
  */
 int           playlist_advance(Playlist *pl);
 

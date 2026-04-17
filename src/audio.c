@@ -29,8 +29,8 @@
 #  define HAVE_CH_LAYOUT 0
 #endif
 
-#define VIDEO_AUDIO_DESYNC_THRESHOLD 0.5
-#define VIDEO_AUDIO_DESYNC_EPSILON   0.01
+#define VIDEO_AUDIO_DESYNC_THRESHOLD 2.0
+#define VIDEO_AUDIO_DESYNC_EPSILON   0.1
 
 static int get_channels(AVCodecParameters *par)
 {

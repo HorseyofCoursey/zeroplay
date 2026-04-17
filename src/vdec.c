@@ -14,8 +14,8 @@
 #include <libavutil/avutil.h>
 #include <libavutil/mathematics.h>
 
-#define VIDEO_AUDIO_DESYNC_THRESHOLD 0.5
-#define VIDEO_AUDIO_DESYNC_EPSILON   0.01
+#define VIDEO_AUDIO_DESYNC_THRESHOLD 2.0
+#define VIDEO_AUDIO_DESYNC_EPSILON   0.1
 
 /* ------------------------------------------------------------------ */
 /* Internal helpers                                                     */

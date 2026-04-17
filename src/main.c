@@ -52,6 +52,7 @@ typedef struct {
     int         health_port;
 #endif
     int64_t     hls_max_bandwidth;
+    int         yt_quality;         /* --yt-quality, 0 = default 480p */
 } Options;
 
 static void print_usage(void)
@@ -60,7 +61,8 @@ static void print_usage(void)
         "usage: zeroplay [options] <path> [path2 ...]\n"
         "\n"
         "  Each path can be a video/image file, a .txt/.m3u playlist,\n"
-        "  or a directory. Up to %d paths may be given; each is assigned\n"
+        "  a directory, a URL, or a YouTube URL.\n"
+        "  Up to %d paths may be given; each is assigned\n"
         "  to a connected display in DRM enumeration order.\n"
         "\n"
         "options:\n"
@@ -72,6 +74,8 @@ static void print_usage(void)
         "  --audio-device dev      ALSA device (default: auto-detect)\n"
         "  --sub path              external subtitle file (.srt)\n"
         "  --hls-bitrate BPS       max HLS bandwidth in bps (or HLS_MAX_BANDWIDTH env)\n"
+        "  --yt-quality n          YouTube stream height cap (default: 480)\n"
+        "                          e.g. 360, 480, 720, 1080 (requires yt-dlp)\n"
         "  --image-duration n      seconds per image (default 10, 0 = hold forever)\n"
         "  --verbose               print decoder/driver info\n"
         "  --help                  show this message\n"
@@ -112,6 +116,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
         { "image-duration",   required_argument, NULL, 'd' },
         { "verbose",          no_argument,       NULL, 'V' },
         { "hls-bitrate",      required_argument, NULL, 'B' },
+        { "yt-quality",       required_argument, NULL, 'Y' },
         { "help",             no_argument,       NULL, 'h' },
         { "ws-url",           required_argument, NULL, 'W' },
         { "device-token",     required_argument, NULL, 'T' },
@@ -132,6 +137,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
             case 'd': opt->image_duration_s  = atof(optarg); break;
             case 'V': g_verbose              = 1;            break;
             case 'B': opt->hls_max_bandwidth = atoll(optarg); break;
+            case 'Y': opt->yt_quality        = atoi(optarg); break;
             case 'h': print_usage(); exit(0);
 #ifdef HAVE_WEBSOCKET
             case 'W': opt->ws_url        = optarg;       break;
@@ -148,6 +154,10 @@ static int parse_args(int argc, char *argv[], Options *opt)
         const char *hb = getenv("HLS_MAX_BANDWIDTH");
         if (!hb) hb = getenv("MPV_HLS_BITRATE");
         if (hb) opt->hls_max_bandwidth = atoll(hb);
+    }
+    if (opt->yt_quality == 0) {
+        const char *yq = getenv("YT_QUALITY");
+        if (yq) opt->yt_quality = atoi(yq);
     }
     if (!opt->audio_device) {
         const char *ad = getenv("AUDIO_DEVICE");
@@ -188,11 +198,11 @@ static void parse_separated_video_audio_url(const char *url, char *url_video, ch
         return;
     }
 
-    const char *url_video_open = url;
+    const char *url_video_open  = url;
     const char *url_video_close = strchr(url, ')');
     if (!url_video_close) return;
 
-    const char *url_audio_open = url_video_close + 1;
+    const char *url_audio_open  = url_video_close + 1;
     const char *url_audio_close = strrchr(url, ')');
     if (url_audio_close == url_video_close) return;
 
@@ -298,7 +308,7 @@ static int find_srt_alongside(const char *video_path,
 typedef struct {
     Playlist     playlist;
     DemuxContext demux;
-    DemuxContext demux_audio; /* Separate demuxer for audio only to be able to combine separate video and audio inputs */
+    DemuxContext demux_audio;
     VdecContext  vdec;
     AudioContext audio;
     Queue        video_queue;
@@ -330,7 +340,7 @@ typedef struct {
     int          separate_audio;
     int64_t      image_duration_us;
     int64_t      duration_us;
-    DrmContext  *drm_ctx;      /* for subtitle overlay */
+    DrmContext  *drm_ctx;
 } PlayerContext;
 
 typedef struct { PlayerContext *p; } ThreadArg;
@@ -370,7 +380,7 @@ static void player_threads_start(PlayerContext *p)
         pthread_create(&p->datid, NULL, demux_audio_thread, daa);
     }
     ThreadArg *va = malloc(sizeof(*va)); va->p = p;
-    pthread_create(&p->vtid, NULL, vdec_thread,  va);
+    pthread_create(&p->vtid, NULL, vdec_thread, va);
     if (p->audio_active) {
         ThreadArg *aa = malloc(sizeof(*aa)); aa->p = p;
         pthread_create(&p->atid, NULL, audio_thread, aa);
@@ -386,7 +396,6 @@ static void player_threads_stop(PlayerContext *p)
     queue_close(&p->video_queue);
     queue_close(&p->audio_queue);
     queue_close(&p->frame_queue);
-
     if (p->sub_active && p->sub_embedded)
         queue_close(&p->sub_queue);
     pthread_join(p->dtid, NULL);
@@ -440,7 +449,6 @@ static void player_close_pipeline(PlayerContext *p)
         p->sub_active    = 0;
         p->sub_embedded  = 0;
         p->last_sub_text = NULL;
-        /* Clear subtitle overlay plane */
         if (p->drm_ctx)
             drm_subtitle_update(p->drm_ctx, p->output_idx, NULL);
     }
@@ -460,7 +468,8 @@ static void player_close_pipeline(PlayerContext *p)
     p->eos           = 0;
 }
 
-static int player_open_video(PlayerContext *p, const char *filename, const char *filename_audio,
+static int player_open_video(PlayerContext *p, const char *filename,
+                              const char *filename_audio,
                               const Options *opt)
 {
     p->separate_audio = filename_audio[0] != '\0';
@@ -474,13 +483,12 @@ static int player_open_video(PlayerContext *p, const char *filename, const char 
         return -1;
 
     if (!p->no_audio && p->separate_audio)
-        if (demux_open(&p->demux_audio, filename_audio, &p->video_queue, &p->audio_queue,
-                    opt->hls_max_bandwidth, 1) < 0)
+        if (demux_open(&p->demux_audio, filename_audio, &p->video_queue,
+                       &p->audio_queue, opt->hls_max_bandwidth, 1) < 0)
             return -1;
 
-    if (p->no_audio) {
+    if (p->no_audio)
         p->demux.audio_stream_idx = -1;
-    }
 
     AVStream *video_stream =
         p->demux.fmt_ctx->streams[p->demux.video_stream_idx];
@@ -499,20 +507,24 @@ static int player_open_video(PlayerContext *p, const char *filename, const char 
                 p->demux.fmt_ctx->streams[p->demux.audio_stream_idx];
         }
 
-        if (audio_stream && (audio_open(&p->audio, audio_stream, opt->audio_device,
-                        &p->audio_queue) == 0)) {
+        if (audio_stream && (audio_open(&p->audio, audio_stream,
+                                         opt->audio_device,
+                                         &p->audio_queue) == 0)) {
             p->audio.volume = opt->vol / 100.0f;
             p->audio_active = 1;
 
-            if (p->separate_audio)
-            {
-                p->vdec.audio_pts = &p->audio.audio_pts;
+            if (p->separate_audio) {
+                p->vdec.audio_pts       = &p->audio.audio_pts;
                 p->vdec.video_time_base = 1.0 / 1000000LL;
-                p->vdec.audio_time_base = av_q2d(p->demux_audio.fmt_ctx->streams[p->demux_audio.audio_stream_idx]->time_base);
+                p->vdec.audio_time_base = av_q2d(
+                    p->demux_audio.fmt_ctx->streams[
+                        p->demux_audio.audio_stream_idx]->time_base);
 
-                p->audio.video_pts = &p->current_pts;
+                p->audio.video_pts       = &p->current_pts;
                 p->audio.video_time_base = 1.0 / 1000000LL;
-                p->audio.audio_time_base = av_q2d(p->demux_audio.fmt_ctx->streams[p->demux_audio.audio_stream_idx]->time_base);
+                p->audio.audio_time_base = av_q2d(
+                    p->demux_audio.fmt_ctx->streams[
+                        p->demux_audio.audio_stream_idx]->time_base);
             }
         }
     }
@@ -622,19 +634,20 @@ static int player_advance_to_next(PlayerContext *p, DrmContext *drm,
         p->image_mode = 0;
 
         if (player_open_video(p, item->path, item->path_audio, opt) < 0) {
-            fprintf(stderr, "zeroplay[%d]: failed to open '%s' '%s', skipping\n",
-                    p->output_idx, item->path, item->path_audio);
+            fprintf(stderr, "zeroplay[%d]: failed to open '%s', skipping\n",
+                    p->output_idx, item->path);
             return player_advance_to_next(p, drm, opt);
         }
-        fprintf(stderr, "zeroplay[%d]: playing '%s' '%s'\n",
-                p->output_idx, basename(item->path), basename(item->path_audio));
+        fprintf(stderr, "zeroplay[%d]: playing '%s'\n",
+                p->output_idx, basename(item->path));
         player_threads_start(p);
     }
 
     return 0;
 }
 
-static int player_open(PlayerContext *p, const char *path, const char *path_audio,
+static int player_open(PlayerContext *p, const char *path,
+                        const char *path_audio,
                         const Options *opt, int output_idx, DrmContext *drm)
 {
     memset(p, 0, sizeof(*p));
@@ -644,7 +657,8 @@ static int player_open(PlayerContext *p, const char *path, const char *path_audi
     p->image_duration_us = (int64_t)(opt->image_duration_s * 1000000.0);
     p->drm_ctx           = drm;
 
-    if (playlist_open(&p->playlist, path, path_audio, opt->loop, opt->shuffle) < 0)
+    if (playlist_open(&p->playlist, path, path_audio,
+                      opt->loop, opt->shuffle, opt->yt_quality) < 0)
         return -1;
 
     PlaylistItem *item = playlist_current(&p->playlist);
@@ -673,8 +687,8 @@ static int player_open(PlayerContext *p, const char *path, const char *path_audi
             playlist_close(&p->playlist);
             return -1;
         }
-        fprintf(stderr, "zeroplay[%d]: playing '%s' '%s'\n",
-                output_idx, basename(item->path), basename(item->path_audio));
+        fprintf(stderr, "zeroplay[%d]: playing '%s'\n",
+                output_idx, basename(item->path));
     }
 
     return 0;
@@ -776,7 +790,7 @@ static int run_ws_mode(Options *opt)
         WsCommand cmd;
         while (ws_cmd_queue_pop(&cmd_queue, &cmd)) {
             switch (cmd.type) {
-            case CMD_LOAD:
+            case CMD_LOAD: {
                 fprintf(stderr, "zeroplay: load %s\n", cmd.url);
                 player_close_pipeline(&player);
                 paused = 0;
@@ -800,6 +814,7 @@ static int run_ws_mode(Options *opt)
                     ws_shared_state_set_paused(&shared, 0);
                 }
                 break;
+            }
             case CMD_PLAY:
                 if (player.pipeline_open && paused) {
                     paused = 0;
@@ -878,7 +893,6 @@ static int run_ws_mode(Options *opt)
         p->current_pts = frame->pts_us;
         ws_shared_state_set_position(&shared, frame->pts_us / 1e6);
 
-        /* Update subtitle overlay when cue changes */
         if (p->sub_active) {
             const char *sub = subtitle_get_active(&p->sub, p->current_pts);
             if (sub != p->last_sub_text) {
@@ -1151,7 +1165,6 @@ int main(int argc, char *argv[])
             DecodedFrame *frame = p->held_frame;
             p->current_pts = frame->pts_us;
 
-            /* Update subtitle overlay when cue changes */
             if (p->sub_active) {
                 const char *sub = subtitle_get_active(&p->sub, p->current_pts);
                 if (sub != p->last_sub_text) {
