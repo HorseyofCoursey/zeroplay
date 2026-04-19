@@ -14,8 +14,9 @@
 #include <libavutil/avutil.h>
 #include <libavutil/mathematics.h>
 
-#define VIDEO_AUDIO_DESYNC_THRESHOLD 2.0
-#define VIDEO_AUDIO_DESYNC_EPSILON   0.1
+#define VIDEO_AUDIO_DESYNC_THRESHOLD_MAX 0.5
+#define VIDEO_AUDIO_DESYNC_THRESHOLD_MIN 0.1
+#define VIDEO_AUDIO_DESYNC_EPSILON       0.01
 
 /* ------------------------------------------------------------------ */
 /* Internal helpers                                                     */
@@ -594,11 +595,11 @@ void vdec_run(VdecContext *ctx)
 
                         if (first_iter) {
                             first_iter = 0;
-                            if (delta < VIDEO_AUDIO_DESYNC_THRESHOLD) break;
+                            if (delta < VIDEO_AUDIO_DESYNC_THRESHOLD_MAX) break;
                         }
 
                         usleep(VIDEO_AUDIO_DESYNC_EPSILON * 1000000.0);
-                    } while (!ctx->packet_queue->closed && (delta > VIDEO_AUDIO_DESYNC_EPSILON));
+                    } while (!ctx->packet_queue->closed && (delta > VIDEO_AUDIO_DESYNC_THRESHOLD_MIN));
                 }
 
                 if (!queue_push(ctx->frame_queue, frame)) {

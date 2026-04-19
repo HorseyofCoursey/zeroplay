@@ -29,8 +29,9 @@
 #  define HAVE_CH_LAYOUT 0
 #endif
 
-#define VIDEO_AUDIO_DESYNC_THRESHOLD 2.0
-#define VIDEO_AUDIO_DESYNC_EPSILON   0.1
+#define VIDEO_AUDIO_DESYNC_THRESHOLD_MAX 0.5
+#define VIDEO_AUDIO_DESYNC_THRESHOLD_MIN 0.1
+#define VIDEO_AUDIO_DESYNC_EPSILON       0.01
 
 static int get_channels(AVCodecParameters *par)
 {
@@ -462,11 +463,11 @@ void audio_run(AudioContext *ctx)
 
                 if (first_iter) {
                     first_iter = 0;
-                    if (delta < VIDEO_AUDIO_DESYNC_THRESHOLD) break;
+                    if (delta < VIDEO_AUDIO_DESYNC_THRESHOLD_MAX) break;
                 }
 
                 usleep(VIDEO_AUDIO_DESYNC_EPSILON * 1000000.0);
-            } while (!ctx->audio_queue->closed && (delta > VIDEO_AUDIO_DESYNC_EPSILON));
+            } while (!ctx->audio_queue->closed && (delta > VIDEO_AUDIO_DESYNC_THRESHOLD_MIN));
 
             ctx->audio_pts = audio_pts;
         }
