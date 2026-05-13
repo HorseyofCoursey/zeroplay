@@ -493,7 +493,8 @@ void vdec_run(VdecContext *ctx)
                         AVPacket *pkt = (AVPacket *)item;
                         av_packet_free(&pkt);
                     }
-                    break;
+                    eos = 1;
+		    break;
                 }
 
                 if (!queue_pop(ctx->packet_queue, &item)) {
@@ -610,7 +611,7 @@ void vdec_run(VdecContext *ctx)
         }
 
         if (eos) {
-            if (++eos_polls > 20) break;
+            if (++eos_polls > 3) break;
         }
 
         /* If SOURCE_CHANGE never arrives after 10 real seconds, the

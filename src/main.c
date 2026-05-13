@@ -408,7 +408,7 @@ static void player_threads_stop(PlayerContext *p)
     }
     if (p->sub_active && p->sub_embedded)
         pthread_join(p->stid, NULL);
-}
+    }
 
 static void player_queues_reinit(PlayerContext *p)
 {
@@ -878,6 +878,10 @@ static int run_ws_mode(Options *opt)
             int rc = queue_trypop(&p->frame_queue, &item);
             if (rc == 0) { sleep_us(2000); continue; }
             if (rc < 0) {
+		if (p->prev_frame) {
+        	    vdec_requeue_frame(&p->vdec, p->prev_frame);
+                    p->prev_frame = NULL;
+    		}
                 fprintf(stderr, "zeroplay: end of stream\n");
                 player_close_pipeline(p);
                 ws_shared_state_set_idle(&shared, 1);
@@ -1150,9 +1154,16 @@ int main(int argc, char *argv[])
             if (!p->held_frame) {
                 void *item = NULL;
                 int rc = queue_trypop(&p->frame_queue, &item);
-                if (rc == 0) { next_due = 0; continue; }
+                if (rc == 0) {
+                    next_due = 0;
+                    continue;
+                }
                 if (rc < 0) {
-                    if (player_advance_to_next(p, &drm, &opt) < 0)
+   		     if (p->prev_frame) {
+        		vdec_requeue_frame(&p->vdec, p->prev_frame);
+        		p->prev_frame = NULL;
+		 }
+		 if (player_advance_to_next(p, &drm, &opt) < 0)
                         p->eos = 1;
                     else
                         next_due = 0;
