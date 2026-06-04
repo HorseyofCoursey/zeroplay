@@ -37,7 +37,7 @@ typedef struct {
  * Returns 0 on success, -1 on error.
  */
 int           playlist_open(Playlist *pl, const char *path, const char *path_audio,
-                             int loop, int shuffle, int yt_quality);
+                             int loop, int shuffle, int recurse, int yt_quality);
 void          playlist_close(Playlist *pl);
 
 /* Returns pointer to current item, or NULL if empty. */

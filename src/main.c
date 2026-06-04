@@ -46,6 +46,7 @@ typedef struct {
     const char *sub_path;
     float       image_duration_s;
     int         shuffle;
+    int         recurse;
 #ifdef HAVE_WEBSOCKET
     const char *ws_url;
     const char *device_token;
@@ -68,6 +69,7 @@ static void print_usage(void)
         "options:\n"
         "  --loop                  loop playlist indefinitely\n"
         "  --shuffle               randomise playlist order\n"
+        "  --recursive             recurse into subdirectories when loading files from a folder\n"
         "  --no-audio              disable audio\n"
         "  --vol n                 initial volume 0-200 (default 100)\n"
         "  --pos n                 start position in seconds (video only)\n"
@@ -108,6 +110,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
     static struct option long_opts[] = {
         { "loop",             no_argument,       NULL, 'l' },
         { "shuffle",          no_argument,       NULL, 'r' },
+        { "recursive",        no_argument,       NULL, 'R' },
         { "no-audio",         no_argument,       NULL, 'n' },
         { "vol",              required_argument, NULL, 'v' },
         { "pos",              required_argument, NULL, 'p' },
@@ -129,6 +132,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
         switch (c) {
             case 'l': opt->loop              = 1;            break;
             case 'r': opt->shuffle           = 1;            break;
+            case 'R': opt->recurse           = 1;            break;
             case 'n': opt->no_audio          = 1;            break;
             case 'v': opt->vol               = atof(optarg); break;
             case 'p': opt->start_pos         = atof(optarg); break;
@@ -658,7 +662,7 @@ static int player_open(PlayerContext *p, const char *path,
     p->drm_ctx           = drm;
 
     if (playlist_open(&p->playlist, path, path_audio,
-                      opt->loop, opt->shuffle, opt->yt_quality) < 0)
+                      opt->loop, opt->shuffle, opt->recurse, opt->yt_quality) < 0)
         return -1;
 
     PlaylistItem *item = playlist_current(&p->playlist);

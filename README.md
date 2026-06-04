@@ -110,6 +110,7 @@ Each path can be a video file, image, `.txt`/`.m3u` playlist, directory, URL, or
 |---|---|
 | `--loop` | Loop playback indefinitely |
 | `--shuffle` | Randomise playlist order |
+| `--recursive` | Load files from folder recursively |
 | `--no-audio` | Disable audio |
 | `--vol n` | Initial volume, 0–200 (default: 100) |
 | `--pos n` | Start position in seconds |
@@ -150,6 +151,9 @@ zeroplay --sub subtitles.srt movie.mp4
 
 # Play all media in a directory
 zeroplay /home/pi/media/
+
+# Play all media in a directory and its subdirectories
+zeroplay --recursive /home/pi/media/
 
 # Play a playlist file, loop and shuffle
 zeroplay --loop --shuffle playlist.txt
