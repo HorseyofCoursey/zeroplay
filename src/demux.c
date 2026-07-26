@@ -4,7 +4,15 @@
 #include <stdlib.h>
 #include <libavutil/version.h>
 #include <libavcodec/avcodec.h>
-
+/* AV_PROFILE_* replaced FF_PROFILE_* in FFmpeg 7.0 (libavcodec 61).
+ * Map the new names onto the old ones for Bookworm and earlier. */
+#if LIBAVCODEC_VERSION_MAJOR < 61
+#define AV_PROFILE_H264_BASELINE             FF_PROFILE_H264_BASELINE
+#define AV_PROFILE_H264_CONSTRAINED_BASELINE FF_PROFILE_H264_CONSTRAINED_BASELINE
+#define AV_PROFILE_H264_MAIN                 FF_PROFILE_H264_MAIN
+#define AV_PROFILE_H264_EXTENDED             FF_PROFILE_H264_EXTENDED
+#define AV_PROFILE_H264_HIGH                 FF_PROFILE_H264_HIGH
+#endif
 int demux_open(DemuxContext *ctx, const char *filename,
                Queue *video_queue, Queue *audio_queue,
                int64_t hls_max_bandwidth, int separate_audio)
