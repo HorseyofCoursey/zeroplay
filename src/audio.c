@@ -275,6 +275,7 @@ int audio_open(AudioContext *ctx, AVStream *stream,
             "hdmi:CARD=vc4hdmi0,DEV=0",    /* Pi 4 (HDMI port 0) */
             "plughw:CARD=vc4hdmi,DEV=0",   /* fallback */
             "plughw:CARD=vc4hdmi0,DEV=0",  /* fallback */
+            "plughw:CARD=Headphones,DEV=0", /* detect Headphones on Pi 4 */
             NULL
         };
         ctx->device[0] = '\0';
