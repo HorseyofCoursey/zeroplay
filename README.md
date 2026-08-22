@@ -19,6 +19,8 @@ ZeroPlay runs on any Linux device with a V4L2 M2M hardware decoder and DRM/KMS d
 | Pi Zero 2 W | balenaOS (Bookworm) |
 | Pi 3 / 3+ | Raspberry Pi OS Lite 32/64-bit (Trixie) |
 | Pi 4 | Raspberry Pi OS Lite 32/64-bit (Trixie) |
+| Pi 1 Model B | 
+
 
 Both 32-bit and 64-bit builds are supported. The install script builds from source automatically for the correct architecture.
 
