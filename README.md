@@ -28,11 +28,11 @@ Both 32-bit and 64-bit builds are supported. The install script builds from sour
 
 ## Supported Formats
 
-| Codec | Container |
-|---|---|
-| H.264 (up to High@L4.1) | MP4, MKV, MOV, HLS (.m3u8) |
-| H.263 | MP4, MKV |
-| MPEG-4 | MP4, MKV |
+ZeroPlay decodes **H.264 only**. Other codecs will fail with an "unsupported codec" error — transcode them to H.264 first.
+
+| Codec | Profiles | Container |
+|---|---|---|
+| H.264 | Baseline to High, up to level 4.2 | MP4, MKV, MOV, HLS (.m3u8) |
 
 H.264 is hardware decoded via the bcm2835 VPU on Pi Zero W, Pi Zero 2W, and Pi 3, and the V4L2 stateful decoder on Pi 4.
 
