@@ -110,21 +110,22 @@ Each path can be a video file, image, `.txt`/`.m3u` playlist, directory, URL, or
 
 ### Options
 
-| Flag | Description |
-|---|---|
-| `--loop` | Loop playback indefinitely |
-| `--shuffle` | Randomise playlist order |
-| `--recursive` | Load files from folder recursively |
-| `--no-audio` | Disable audio |
-| `--vol n` | Initial volume, 0–200 (default: 100) |
-| `--pos n` | Start position in seconds |
-| `--audio-device dev` | ALSA device override |
-| `--sub path` | External subtitle file (.srt) |
-| `--hls-bitrate bps` | Cap HLS variant bitrate in bps (or `HLS_MAX_BANDWIDTH` env) |
-| `--yt-quality n` | YouTube stream height: 360, 480, 720, 1080 (default: 480) |
-| `--image-duration n` | Seconds per image (default: 10, 0 = hold forever) |
-| `--verbose` | Print decoder and driver info |
-| `--help` | Show usage |
+| Flag                 | Description                                                 |
+|----------------------|-------------------------------------------------------------|
+| `--loop`             | Loop playback indefinitely                                  |
+| `--loop-seamless`    | Loop playback indefinitely, seamlessly                      |
+| `--shuffle`          | Randomise playlist order                                    |
+| `--recursive`        | Load files from folder recursively                          |
+| `--no-audio`         | Disable audio                                               |
+| `--vol n`            | Initial volume, 0–200 (default: 100)                        |
+| `--pos n`            | Start position in seconds                                   |
+| `--audio-device dev` | ALSA device override                                        |
+| `--sub path`         | External subtitle file (.srt)                               |
+| `--hls-bitrate bps`  | Cap HLS variant bitrate in bps (or `HLS_MAX_BANDWIDTH` env) |
+| `--yt-quality n`     | YouTube stream height: 360, 480, 720, 1080 (default: 480)   |
+| `--image-duration n` | Seconds per image (default: 10, 0 = hold forever)           |
+| `--verbose`          | Print decoder and driver info                               |
+| `--help`             | Show usage                                                  |
 
 ### Examples
 
@@ -260,6 +261,20 @@ zeroplay --audio-device plughw:CARD=Headphones,DEV=0 movie.mp4
 # List available devices
 aplay -L
 ```
+
+---
+
+## Seamless loop
+
+To play a video file seamlessly and indefinitely, start zeroplay with the --loop-seamless flag.
+
+Restriction:
+- Does not support external audio or subtitle files.
+
+MP4 Requirements:
+- If the audio stream is longer than the video stream, it will be trimmed to match the video duration.
+- If the video stream is longer than the audio stream, zeroplay will fail.
+- For best results, ensure the MP4 file has matching audio and video durations.
 
 ---
 
