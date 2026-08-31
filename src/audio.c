@@ -409,6 +409,13 @@ void audio_resume(AudioContext *ctx)
     pthread_mutex_unlock(&ctx->pause_mutex);
 }
 
+void apply_fade(int16_t *samples, int nsamples, int nchannels, int fade_in /*1=in,0=out*/) {
+    for (int i = 0; i < nsamples; i++) {
+        float g = fade_in ? (float)i / nsamples : 1.0f - (float)i / nsamples;
+        for (int c = 0; c < nchannels; c++)
+            samples[i*nchannels + c] = (int16_t)(samples[i*nchannels + c] * g);
+    }
+}
 /* ------------------------------------------------------------------ */
 
 void audio_run(AudioContext *ctx)
@@ -425,6 +432,7 @@ void audio_run(AudioContext *ctx)
     int rate_checked       = 0;
     int64_t prev_pts       = AV_NOPTS_VALUE;
     int     prev_nb_samples = 0;
+    int pending_start_frame     = 0;
 
     vlog("audio: playback thread started\n");
 
@@ -442,7 +450,11 @@ void audio_run(AudioContext *ctx)
             break;       /* queue closed — EOS */
 
         /* Decode the packet.  Note: pkt is local — no leak. */
-        AVPacket *pkt = (AVPacket *)item;
+        AudioPkt *audioPkt = (AudioPkt *)item;
+        AVPacket *pkt = (AVPacket *)audioPkt->queued;
+
+        if(audioPkt->is_loop_start && pending_start_frame != 1)
+            pending_start_frame = 1;
 
         /* Block while ahead of video */
         if (ctx->video_pts) {
@@ -584,6 +596,21 @@ void audio_run(AudioContext *ctx)
                         if (v < -32768) v = -32768;
                         s16_data[s] = (int16_t)v;
                     }
+                }
+
+                //seamless looping: fade out audio on the last frame and in on the first frame again
+                //- smoothes the audio-crack at the end of the video
+                int fade_samples = (int)(ctx->alsa_rate * 0.03);
+                if (fade_samples > converted) fade_samples = converted;
+
+                if (pending_start_frame) {
+                    pending_start_frame = 0;
+                    apply_fade(s16_data, fade_samples, ctx->channels, /*fade_in=*/1);
+                }
+                if (audioPkt->is_loop_end) {
+                    int offset_frames = converted - fade_samples;
+                    apply_fade(s16_data + offset_frames * ctx->channels,
+                               fade_samples, ctx->channels, /*fade_in=*/0);
                 }
 
                 snd_pcm_sframes_t written =

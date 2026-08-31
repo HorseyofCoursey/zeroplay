@@ -39,6 +39,7 @@ typedef struct {
     const char *paths[MAX_FILES];
     int         path_count;
     int         loop;
+    int         loop_seamless;
     int         no_audio;
     float       vol;
     double      start_pos;
@@ -69,6 +70,7 @@ static void print_usage(void)
         "\n"
         "options:\n"
         "  --loop                  loop playlist indefinitely\n"
+        "  --loop-seamless         loop one track seamless, indefinitely\n"
         "  --shuffle               randomise playlist order\n"
         "  --recursive             recurse into subdirectories when loading files from a folder\n"
         "  --no-audio              disable audio\n"
@@ -118,6 +120,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
 
     static struct option long_opts[] = {
         { "loop",             no_argument,       NULL, 'l' },
+        { "loop-seamless",    no_argument,       NULL, 'L' },
         { "shuffle",          no_argument,       NULL, 'r' },
         { "recursive",        no_argument,       NULL, 'R' },
         { "no-audio",         no_argument,       NULL, 'n' },
@@ -141,6 +144,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
     while ((c = getopt_long(argc, argv, "", long_opts, NULL)) != -1) {
         switch (c) {
             case 'l': opt->loop              = 1;            break;
+            case 'L': opt->loop_seamless     = 1;            break;
             case 'r': opt->shuffle           = 1;            break;
             case 'R': opt->recurse           = 1;            break;
             case 'n': opt->no_audio          = 1;            break;
@@ -340,6 +344,9 @@ typedef struct {
     int              sub_embedded;
     const char      *last_sub_text;
 
+    int          loop;
+    int          loop_seamless;
+
     int64_t      wall_start;
     int          frame_count;
     int64_t      current_pts;
@@ -388,6 +395,7 @@ static void *subtitle_thread(void *arg)
 
 static void player_threads_start(PlayerContext *p)
 {
+    p->demux.loop_seamless = p->loop_seamless;
     ThreadArg *da = malloc(sizeof(*da)); da->p = p;
     pthread_create(&p->dtid, NULL, demux_thread, da);
     if (p->audio_active && p->separate_audio) {
@@ -423,7 +431,7 @@ static void player_threads_stop(PlayerContext *p)
     }
     if (p->sub_active && p->sub_embedded)
         pthread_join(p->stid, NULL);
-    }
+}
 
 static void player_queues_reinit(PlayerContext *p)
 {
@@ -671,6 +679,7 @@ static int player_open(PlayerContext *p, const char *path,
     p->separate_audio    = 0;
     p->image_duration_us = (int64_t)(opt->image_duration_s * 1000000.0);
     p->drm_ctx           = drm;
+    p->loop_seamless     = opt->loop_seamless;
 
     if (playlist_open(&p->playlist, path, path_audio,
                       opt->loop, opt->shuffle, opt->recurse, opt->yt_quality) < 0)
@@ -795,6 +804,7 @@ static int run_ws_mode(Options *opt)
     memset(&player, 0, sizeof(player));
     player.output_idx = 0;
     player.no_audio   = opt->no_audio;
+    p.loop_seamless   = opt->loop_seamless;
 
     int paused = 0;
     int audio_started = 0;
@@ -1028,6 +1038,7 @@ static int run_control_mode(Options *opt)
     player.no_audio          = opt->no_audio;
     player.drm_ctx           = &drm;
     player.image_duration_us = (int64_t)(opt->image_duration_s * 1000000.0);
+    player.loop_seamless     = opt->loop_seamless;
 
     int  paused        = 0;
     int  audio_started = 0;
@@ -1075,6 +1086,7 @@ static int run_control_mode(Options *opt)
                     current_loop    = 0;
                 } else {
                     if (player.audio_active) audio_pause(&player.audio);
+
                     player_threads_start(&player);
                     current_loop = loop;
                     fprintf(stderr, "zeroplay: %s %s\n",

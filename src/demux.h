@@ -10,6 +10,12 @@ typedef struct {
     int              audio_stream_idx;
     int              subtitle_stream_idx;  /* -1 if none */
     int64_t          duration_us;          /* total file duration in microseconds */
+    int              loop_seamless;        /* 1 = loop actual video seamlessly */
+
+    int64_t          video_rebase;      /* rebase-values for seamless looping if audio duration != video-duration */
+    int64_t          audio_rebase;
+    int64_t          sub_rebase;
+
     Queue           *video_queue;
     Queue           *audio_queue;
     Queue           *subtitle_queue;       /* NULL = drop subtitle packets */
