@@ -31,6 +31,7 @@ typedef struct {
     AVBSFContext   *bsf;
     AVRational      time_base;
     uint32_t        v4l2_pixfmt;   /* V4L2 format for this stream's codec */
+    uint32_t        cap_pixfmt;    /* CAPTURE (decoded) format: NV12 or RGB565 */
 
     uint32_t        stream_width;
     uint32_t        stream_height;

@@ -14,6 +14,9 @@
 #include <libavutil/avutil.h>
 #include <libavutil/mathematics.h>
 
+/* Set by drm_open(): decode straight to RGB565 for an SPI/DBI panel. */
+extern int g_drm_spi_panel;
+
 #define VIDEO_AUDIO_DESYNC_THRESHOLD_MAX 0.5
 #define VIDEO_AUDIO_DESYNC_THRESHOLD_MIN 0.1
 #define VIDEO_AUDIO_DESYNC_EPSILON       0.01
@@ -153,12 +156,17 @@ static int handle_source_change(VdecContext *ctx)
     fmt.type                   = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     fmt.fmt.pix_mp.width       = w;
     fmt.fmt.pix_mp.height      = h;
-    fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+    fmt.fmt.pix_mp.pixelformat = ctx->cap_pixfmt;
     fmt.fmt.pix_mp.field       = V4L2_FIELD_NONE;
     fmt.fmt.pix_mp.num_planes  = 1;
 
     if (xioctl(ctx->fd, VIDIOC_S_FMT, &fmt) < 0) {
         perror("vdec: VIDIOC_S_FMT CAPTURE");
+        return -1;
+    }
+    if (fmt.fmt.pix_mp.pixelformat != ctx->cap_pixfmt) {
+        fprintf(stderr, "vdec: decoder rejected %.4s CAPTURE format, got %.4s\n",
+                (char *)&ctx->cap_pixfmt, (char *)&fmt.fmt.pix_mp.pixelformat);
         return -1;
     }
 
@@ -279,6 +287,8 @@ int vdec_open(VdecContext *ctx, AVStream *stream,
     ctx->packet_queue  = packet_queue;
     ctx->frame_queue   = frame_queue;
     ctx->time_base     = stream->time_base;
+    ctx->cap_pixfmt    = g_drm_spi_panel ? V4L2_PIX_FMT_RGB565
+                                         : V4L2_PIX_FMT_NV12;
     ctx->orig_height   = (uint32_t)stream->codecpar->height;
     ctx->stream_width  = (uint32_t)stream->codecpar->width;
     ctx->stream_height = (uint32_t)stream->codecpar->height;
@@ -392,7 +402,7 @@ int vdec_open(VdecContext *ctx, AVStream *stream,
         cap_fmt.type                   = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         cap_fmt.fmt.pix_mp.width       = ctx->stream_width;
         cap_fmt.fmt.pix_mp.height      = ctx->stream_height;
-        cap_fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+        cap_fmt.fmt.pix_mp.pixelformat = ctx->cap_pixfmt;
         cap_fmt.fmt.pix_mp.field       = V4L2_FIELD_NONE;
         cap_fmt.fmt.pix_mp.num_planes  = 1;
         xioctl(ctx->fd, VIDIOC_S_FMT, &cap_fmt);
