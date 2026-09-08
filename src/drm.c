@@ -17,6 +17,8 @@
 #include FT_FREETYPE_H
 #endif
 
+int g_drm_spi_panel = 0;
+
 /* ------------------------------------------------------------------ */
 /* Bitmap font — public domain 8x8, chars 0x20-0x7E                   */
 /* Each byte = one row (top→bottom). Bit 0 = leftmost pixel.          */
@@ -475,6 +477,11 @@ static int plane_supports_nv12(int fd, uint32_t plane_id)
     return plane_supports_format(fd, plane_id, DRM_FORMAT_NV12);
 }
 
+static int plane_supports_rgb565(int fd, uint32_t plane_id)
+{
+    return plane_supports_format(fd, plane_id, DRM_FORMAT_RGB565);
+}
+
 static int plane_supports_argb8888(int fd, uint32_t plane_id)
 {
     return plane_supports_format(fd, plane_id, DRM_FORMAT_ARGB8888);
@@ -588,6 +595,7 @@ static void release_prev(int fd, DrmOutput *out)
  */
 static int do_atomic_commit(int fd, DrmOutput *out,
                              uint32_t fb_id,
+                             uint32_t src_x, uint32_t src_y,
                              uint32_t src_w, uint32_t src_h,
                              int need_modeset)
 {
@@ -603,8 +611,10 @@ static int do_atomic_commit(int fd, DrmOutput *out,
                                  out->prop_crtc_id, out->crtc_id);
     }
 
-    drmModeAtomicAddProperty(areq, out->plane_id, out->prop_src_x, 0);
-    drmModeAtomicAddProperty(areq, out->plane_id, out->prop_src_y, 0);
+    drmModeAtomicAddProperty(areq, out->plane_id, out->prop_src_x,
+                             (uint64_t)src_x << 16);
+    drmModeAtomicAddProperty(areq, out->plane_id, out->prop_src_y,
+                             (uint64_t)src_y << 16);
     drmModeAtomicAddProperty(areq, out->plane_id,
                              out->prop_src_w, (uint64_t)src_w << 16);
     drmModeAtomicAddProperty(areq, out->plane_id,
@@ -787,13 +797,28 @@ static int setup_output(int fd, drmModeRes *res,
         return -1;
     }
 
-    /* Pass 1: find NV12-capable video plane */
+    /* Pass 1: find NV12-capable video plane (hardware-scaled path) */
     for (uint32_t i = 0; i < pr->count_planes && !out->plane_id; i++) {
         drmModePlane *p = drmModeGetPlane(fd, pr->planes[i]);
         if (!p) continue;
         if ((p->possible_crtcs & (1u << crtc_idx)) &&
-            plane_supports_nv12(fd, p->plane_id))
-            out->plane_id = p->plane_id;
+            plane_supports_nv12(fd, p->plane_id)) {
+            out->plane_id     = p->plane_id;
+            out->plane_format = DRM_FORMAT_NV12;
+        }
+        drmModeFreePlane(p);
+    }
+
+    /* Pass 1b: no NV12 plane (e.g. an SPI/DBI panel) — fall back to an
+     * RGB565 plane and drive it with a centre-crop instead of scaling. */
+    for (uint32_t i = 0; i < pr->count_planes && !out->plane_id; i++) {
+        drmModePlane *p = drmModeGetPlane(fd, pr->planes[i]);
+        if (!p) continue;
+        if ((p->possible_crtcs & (1u << crtc_idx)) &&
+            plane_supports_rgb565(fd, p->plane_id)) {
+            out->plane_id     = p->plane_id;
+            out->plane_format = DRM_FORMAT_RGB565;
+        }
         drmModeFreePlane(p);
     }
 
@@ -811,10 +836,12 @@ static int setup_output(int fd, drmModeRes *res,
     drmModeFreePlaneResources(pr);
 
     if (!out->plane_id) {
-        fprintf(stderr, "drm: no NV12 plane for crtc %u\n", out->crtc_id);
+        fprintf(stderr, "drm: no NV12 or RGB565 plane for crtc %u\n", out->crtc_id);
         drmModeDestroyPropertyBlob(fd, out->mode_blob_id);
         return -1;
     }
+    vlog("drm: connector %u video plane %u format %.4s\n",
+         out->connector_id, out->plane_id, (char *)&out->plane_format);
 
     /* Video plane properties */
     out->prop_crtc_id = get_property_id(fd, out->connector_id,
@@ -954,6 +981,12 @@ int drm_open(DrmContext *ctx)
 
     vlog("drm: %d output(s) found\n", ctx->output_count);
 
+    /* If the primary output is an RGB565 SPI/DBI panel, tell vdec to decode
+     * straight to RGB565 and use the centre-crop present path. */
+    g_drm_spi_panel = (ctx->outputs[0].plane_format == DRM_FORMAT_RGB565);
+    if (g_drm_spi_panel)
+        vlog("drm: SPI/DBI panel detected — RGB565 decode + centre-crop\n");
+
 #ifdef HAVE_FREETYPE
     ft_init();
 #endif
@@ -963,6 +996,82 @@ int drm_open(DrmContext *ctx)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * Present an RGB565 decoded frame on an SPI/DBI panel.
+ * The panel plane cannot scale or be repositioned, so the frame must be at
+ * least panel-sized and we display a panel-sized window centred in it
+ * (requires the drm/mipi-dbi source-offset support).
+ */
+static int drm_present_rgb565(DrmContext *ctx, DrmOutput *out,
+                               DecodedFrame *frame)
+{
+    uint32_t vis_w = frame->width;
+    uint32_t vis_h = frame->src_height;
+
+    if (vis_w < out->mode_w || vis_h < out->mode_h) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr,
+                "drm: frame %ux%u smaller than panel %ux%u — SPI crop path "
+                "needs a source at least panel-sized\n",
+                vis_w, vis_h, out->mode_w, out->mode_h);
+            warned = 1;
+        }
+        return -1;
+    }
+
+    uint32_t gem_handle = 0;
+    if (drmPrimeFDToHandle(ctx->fd, frame->dmabuf_fd, &gem_handle) < 0) {
+        perror("drm: drmPrimeFDToHandle (rgb565)");
+        return -1;
+    }
+
+    uint32_t fb_w = frame->stride / 2;          /* padded width, pixels */
+    uint32_t handles[4] = { gem_handle, 0, 0, 0 };
+    uint32_t pitches[4] = { frame->stride, 0, 0, 0 };
+    uint32_t offsets[4] = { 0, 0, 0, 0 };
+    uint32_t fb_id = 0;
+
+    if (drmModeAddFB2(ctx->fd, fb_w, frame->height, DRM_FORMAT_RGB565,
+                       handles, pitches, offsets, &fb_id, 0) < 0) {
+        perror("drm: drmModeAddFB2 (rgb565)");
+        drmCloseBufferHandle(ctx->fd, gem_handle);
+        return -1;
+    }
+
+    /* Centre-crop: src == panel size, positioned in the larger frame. */
+    uint32_t sw = out->mode_w;
+    uint32_t sh = out->mode_h;
+    uint32_t sx = ((vis_w - sw) / 2) & ~1u;
+    uint32_t sy = ((vis_h - sh) / 2) & ~1u;
+
+    /* Plane fills the whole CRTC (no positioning allowed). */
+    out->dest_x = 0;
+    out->dest_y = 0;
+    out->dest_w = sw;
+    out->dest_h = sh;
+
+    int need_modeset = out->first_frame ||
+                       (out->current_format != DRM_FORMAT_RGB565);
+
+    if (do_atomic_commit(ctx->fd, out, fb_id, sx, sy, sw, sh,
+                          need_modeset) < 0) {
+        perror("drm: atomic commit (rgb565)");
+        drmModeRmFB(ctx->fd, fb_id);
+        drmCloseBufferHandle(ctx->fd, gem_handle);
+        return -1;
+    }
+
+    out->first_frame    = 0;
+    out->current_format = DRM_FORMAT_RGB565;
+
+    release_prev(ctx->fd, out);
+    out->prev_fb_id      = fb_id;
+    out->prev_gem_handle = gem_handle;
+    out->prev_is_dumb    = 0;
+    return 0;
+}
+
 int drm_present(DrmContext *ctx, int output_idx, DecodedFrame *frame)
 {
     if (output_idx < 0 || output_idx >= ctx->output_count) {
@@ -970,6 +1079,9 @@ int drm_present(DrmContext *ctx, int output_idx, DecodedFrame *frame)
         return -1;
     }
     DrmOutput *out = &ctx->outputs[output_idx];
+
+    if (out->plane_format == DRM_FORMAT_RGB565)
+        return drm_present_rgb565(ctx, out, frame);
 
     uint32_t gem_handle = 0;
     if (drmPrimeFDToHandle(ctx->fd, frame->dmabuf_fd, &gem_handle) < 0) {
@@ -1013,7 +1125,7 @@ int drm_present(DrmContext *ctx, int output_idx, DecodedFrame *frame)
     int need_modeset = out->first_frame ||
                        (out->current_format != DRM_FORMAT_NV12);
 
-    ret = do_atomic_commit(ctx->fd, out, fb_id,
+    ret = do_atomic_commit(ctx->fd, out, fb_id, 0, 0,
                            frame->width, frame->src_height, need_modeset);
     if (ret < 0) {
         perror("drm: atomic commit failed");
@@ -1095,7 +1207,7 @@ int drm_present_image(DrmContext *ctx, int output_idx,
     int need_modeset = out->first_frame ||
                        (out->current_format != DRM_FORMAT_XRGB8888);
 
-    if (do_atomic_commit(ctx->fd, out, fb_id,
+    if (do_atomic_commit(ctx->fd, out, fb_id, 0, 0,
                           (uint32_t)width, (uint32_t)height,
                           need_modeset) < 0) {
         perror("drm: atomic commit image");

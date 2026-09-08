@@ -31,6 +31,9 @@ typedef struct {
     uint32_t mode_w;
     uint32_t mode_h;
 
+    /* DRM_FORMAT_NV12 (scaled path) or DRM_FORMAT_RGB565 (SPI/DBI crop path) */
+    uint32_t plane_format;
+
     /* Aspect-correct destination rectangle */
     uint32_t dest_x;
     uint32_t dest_y;
@@ -82,6 +85,13 @@ typedef struct {
     DrmOutput  outputs[DRM_MAX_OUTPUTS];
     int        output_count;
 } DrmContext;
+
+/*
+ * Set by drm_open(): 1 when the video plane is an RGB565 SPI/DBI panel
+ * (no NV12 plane, no scaling). vdec then decodes straight to RGB565 and
+ * drm_present() centre-crops a panel-sized window instead of scaling.
+ */
+extern int g_drm_spi_panel;
 
 int  drm_open(DrmContext *ctx);
 
