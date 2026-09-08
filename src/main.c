@@ -33,6 +33,12 @@ int g_verbose = 0;
 #define SEEK_SHORT_US   (60LL  * 1000000LL)
 #define SEEK_LONG_US    (300LL * 1000000LL)
 
+/* If drm_present() is slower than one frame interval — an SPI/DBI panel
+ * flushes the whole framebuffer over a serial bus — the render loop falls
+ * permanently behind and the video plays in slow motion. Skip presenting a
+ * frame that is already this far past due and move to a fresher one. */
+#define VIDEO_LATE_DROP_US  45000
+
 #define MAX_FILES 4
 
 typedef struct {
@@ -342,6 +348,7 @@ typedef struct {
 
     int64_t      wall_start;
     int          frame_count;
+    int          frames_dropped;   /* late frames skipped to stay real-time */
     int64_t      current_pts;
     DecodedFrame *prev_frame;
     DecodedFrame *held_frame;
@@ -384,6 +391,41 @@ static void *subtitle_thread(void *arg)
 {
     PlayerContext *p = ((ThreadArg *)arg)->p; free(arg);
     subtitle_run(&p->sub); return NULL;
+}
+
+/*
+ * Real-time pacing safety valve for slow displays.
+ *
+ * drm_present() usually returns within a frame interval, but an SPI/DBI
+ * panel flushes its whole framebuffer over a serial bus and can take
+ * longer than that. The render loop then slips further behind on every
+ * frame and playback ends up in slow motion.
+ *
+ * When the held frame is already well past due, drop it — its decode
+ * buffer goes straight back to the decoder, it was never scanned out —
+ * and take the next one. Playback stays real-time; the effective frame
+ * rate falls to whatever the panel sustains. Never drops the only frame
+ * available. Requires wall_start to be set. No-op on a fast display,
+ * where frames are never this late.
+ */
+static DecodedFrame *skip_late_frames(PlayerContext *p)
+{
+    DecodedFrame *frame = p->held_frame;
+
+    while (now_us() - (p->wall_start + frame->pts_us) > VIDEO_LATE_DROP_US) {
+        void *item = NULL;
+        if (queue_trypop(&p->frame_queue, &item) != 1)
+            break;                        /* nothing fresher to show */
+        vdec_requeue_frame(&p->vdec, frame);
+        frame = (DecodedFrame *)item;
+        p->frame_count++;
+        if (++p->frames_dropped % 30 == 0)
+            vlog("display: dropped %d late frames — panel can't sustain "
+                 "the source frame rate\n", p->frames_dropped);
+    }
+
+    p->held_frame = frame;
+    return frame;
 }
 
 static void player_threads_start(PlayerContext *p)
@@ -909,6 +951,12 @@ static int run_ws_mode(Options *opt)
         }
 
         DecodedFrame *frame = p->held_frame;
+
+        if (p->frame_count == 1 || p->wall_start == 0)
+            p->wall_start = now_us() - frame->pts_us;
+
+        frame = skip_late_frames(p);
+
         p->current_pts = frame->pts_us;
         ws_shared_state_set_position(&shared, frame->pts_us / 1e6);
 
@@ -919,9 +967,6 @@ static int run_ws_mode(Options *opt)
                 p->last_sub_text = sub;
             }
         }
-
-        if (p->frame_count == 1 || p->wall_start == 0)
-            p->wall_start = now_us() - frame->pts_us;
 
         int64_t due = p->wall_start + frame->pts_us;
         int64_t now = now_us();
@@ -1146,6 +1191,12 @@ static int run_control_mode(Options *opt)
         }
 
         DecodedFrame *frame = p->held_frame;
+
+        if (p->frame_count == 1 || p->wall_start == 0)
+            p->wall_start = now_us() - frame->pts_us;
+
+        frame = skip_late_frames(p);
+
         p->current_pts = frame->pts_us;
 
         if (p->sub_active) {
@@ -1155,9 +1206,6 @@ static int run_control_mode(Options *opt)
                 p->last_sub_text = sub;
             }
         }
-
-        if (p->frame_count == 1 || p->wall_start == 0)
-            p->wall_start = now_us() - frame->pts_us;
 
         int64_t due = p->wall_start + frame->pts_us;
         int64_t now = now_us();
@@ -1426,6 +1474,12 @@ int main(int argc, char *argv[])
             }
 
             DecodedFrame *frame = p->held_frame;
+
+            if (p->frame_count == 1 || p->wall_start == 0)
+                p->wall_start = now_us() - frame->pts_us;
+
+            frame = skip_late_frames(p);
+
             p->current_pts = frame->pts_us;
 
             if (p->sub_active) {
@@ -1435,9 +1489,6 @@ int main(int argc, char *argv[])
                     p->last_sub_text = sub;
                 }
             }
-
-            if (p->frame_count == 1 || p->wall_start == 0)
-                p->wall_start = now_us() - frame->pts_us;
 
             int64_t due = p->wall_start + frame->pts_us;
             int64_t now = now_us();
