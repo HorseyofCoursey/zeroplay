@@ -26,6 +26,7 @@ typedef struct {
     uint32_t prop_src_y;
     uint32_t prop_src_w;
     uint32_t prop_src_h;
+    uint32_t prop_fb_damage_clips;   /* 0 if unsupported */
 
     uint32_t mode_blob_id;
     uint32_t mode_w;
@@ -37,11 +38,15 @@ typedef struct {
     /* SPI/DBI fit mode: a persistent panel-sized RGB565 buffer that the
      * decoded frame is aspect-fit-scaled into (letterboxed) each present. */
     uint32_t           fit_gem;
+    uint32_t           fit_fb_id;
     uint32_t           fit_pitch;
     size_t             fit_size;
     void              *fit_map;
-    struct SwsContext *fit_sws;
-    uint32_t           fit_src_w, fit_src_h;   /* source size fit_sws was built for */
+    uint16_t          *fit_xmap;                /* source x edges, length fit_dw + 1 */
+    uint8_t           *fit_linebuf;             /* one cached source row for scaling */
+    uint32_t           fit_linebuf_sz;
+    int                fit_need_full;           /* next present must flush whole panel */
+    uint32_t           fit_src_w, fit_src_h;    /* source size fit_xmap was built for */
     uint32_t           fit_dx, fit_dy, fit_dw, fit_dh;  /* scaled rect in the panel */
 
     /* Aspect-correct destination rectangle */

@@ -8,13 +8,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/mman.h>
-#include <sys/ioctl.h>
 #include <sys/select.h>
-#include <linux/dma-buf.h>
 #include <drm_fourcc.h>
 #include <drm_mode.h>
-#include <libswscale/swscale.h>
-#include <libavutil/pixfmt.h>
 
 #ifdef HAVE_FREETYPE
 #include <ft2build.h>
@@ -602,6 +598,7 @@ static int do_atomic_commit(int fd, DrmOutput *out,
                              uint32_t fb_id,
                              uint32_t src_x, uint32_t src_y,
                              uint32_t src_w, uint32_t src_h,
+                             uint32_t damage_blob,
                              int need_modeset)
 {
     drmModeAtomicReq *areq = drmModeAtomicAlloc();
@@ -636,6 +633,9 @@ static int do_atomic_commit(int fd, DrmOutput *out,
                              out->prop_fb_id,   fb_id);
     drmModeAtomicAddProperty(areq, out->plane_id,
                              out->prop_crtc_id, out->crtc_id);
+    if (out->prop_fb_damage_clips && damage_blob)
+        drmModeAtomicAddProperty(areq, out->plane_id,
+                                 out->prop_fb_damage_clips, damage_blob);
 
     uint32_t flags = need_modeset ? DRM_MODE_ATOMIC_ALLOW_MODESET : 0;
     int ret = drmModeAtomicCommit(fd, areq, flags, NULL);
@@ -873,6 +873,8 @@ static int setup_output(int fd, drmModeRes *res,
                                          DRM_MODE_OBJECT_PLANE, "SRC_W");
     out->prop_src_h   = get_property_id(fd, out->plane_id,
                                          DRM_MODE_OBJECT_PLANE, "SRC_H");
+    out->prop_fb_damage_clips = get_property_id(fd, out->plane_id,
+                                         DRM_MODE_OBJECT_PLANE, "FB_DAMAGE_CLIPS");
 
     if (!out->prop_crtc_id || !out->prop_active || !out->prop_mode_id ||
         !out->prop_fb_id   || !out->prop_src_w  || !out->prop_crtc_w) {
@@ -1002,13 +1004,6 @@ int drm_open(DrmContext *ctx)
 
 /* ------------------------------------------------------------------ */
 
-static void dmabuf_cpu_sync(int fd, int start)
-{
-    struct dma_buf_sync s;
-    s.flags = (start ? DMA_BUF_SYNC_START : DMA_BUF_SYNC_END) | DMA_BUF_SYNC_READ;
-    ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);   /* best-effort; -ENOTTY is harmless */
-}
-
 /*
  * SPI/DBI crop-to-fill: display a panel-sized window of the (larger) decoded
  * frame, zero-copy, positioned by the plane source offset. Requires the
@@ -1066,7 +1061,7 @@ static int rgb565_present_crop(DrmContext *ctx, DrmOutput *out,
     int need_modeset = out->first_frame ||
                        (out->current_format != DRM_FORMAT_RGB565);
 
-    if (do_atomic_commit(ctx->fd, out, fb_id, sx, sy, sw, sh,
+    if (do_atomic_commit(ctx->fd, out, fb_id, sx, sy, sw, sh, 0,
                           need_modeset) < 0) {
         perror("drm: atomic commit (rgb565)");
         drmModeRmFB(ctx->fd, fb_id);
@@ -1114,11 +1109,24 @@ static int fit_buffer_alloc(int fd, DrmOutput *out)
         goto err;
     }
 
+    uint32_t handles[4] = { creq.handle, 0, 0, 0 };
+    uint32_t pitches[4] = { creq.pitch,  0, 0, 0 };
+    uint32_t offsets[4] = { 0, 0, 0, 0 };
+    uint32_t fb_id = 0;
+    if (drmModeAddFB2(fd, out->mode_w, out->mode_h, DRM_FORMAT_RGB565,
+                       handles, pitches, offsets, &fb_id, 0) < 0) {
+        perror("drm: fit AddFB2");
+        munmap(map, creq.size);
+        goto err;
+    }
+
     memset(map, 0, creq.size);       /* black letterbox */
     out->fit_gem   = creq.handle;
+    out->fit_fb_id = fb_id;
     out->fit_pitch = creq.pitch;
     out->fit_size  = creq.size;
     out->fit_map   = map;
+    out->fit_need_full = 1;          /* first present paints the whole panel */
     return 0;
 
 err:
@@ -1129,11 +1137,38 @@ err:
     return -1;
 }
 
+/* Nearest-neighbour RGB565 downscale of frame->pixels into the fit rect of
+ * fit_map. The decoder's buffer is uncached DMA memory, so each source row is
+ * pulled into a cached line buffer with one sequential read before sampling. */
+static void fit_scale(DrmOutput *out, const uint8_t *src, uint32_t src_stride,
+                      uint32_t sh)
+{
+    const uint16_t *xe = out->fit_xmap;          /* dw+1 source-x edges */
+    uint32_t dw = out->fit_dw, dh = out->fit_dh;
+    uint32_t ystep = (sh << 16) / dh;
+    uint32_t sy    = ystep >> 1;
+    uint32_t last_srcy = (uint32_t)-1;
+
+    for (uint32_t y = 0; y < dh; y++, sy += ystep) {
+        uint32_t srcy = sy >> 16;
+        if (srcy != last_srcy) {
+            memcpy(out->fit_linebuf, src + (size_t)srcy * src_stride, src_stride);
+            last_srcy = srcy;
+        }
+        const uint16_t *s = (const uint16_t *)out->fit_linebuf;
+        uint16_t *d = (uint16_t *)((uint8_t *)out->fit_map
+                        + (size_t)(out->fit_dy + y) * out->fit_pitch
+                        + (size_t)out->fit_dx * 2);
+        for (uint32_t x = 0; x < dw; x++)
+            d[x] = s[(xe[x] + xe[x + 1]) >> 1];   /* centre of the column's span */
+    }
+}
+
 /*
- * SPI/DBI aspect-fit (default): CPU-scale the decoded frame to fit the panel
- * with black bars, into a persistent panel-sized buffer, present it 1:1.
- * Nearest-neighbour (SWS_POINT) keeps this cheap enough for a Pi Zero.
- * Works with any source size and needs no kernel source-offset support.
+ * SPI/DBI aspect-fit (default): box-average scale the decoded frame to fit the
+ * panel with black bars, into a persistent panel-sized buffer. FB_DAMAGE_CLIPS
+ * limits the SPI flush to the image rect (the bars are static). Works with any
+ * source size and needs no kernel source-offset support.
  */
 static int rgb565_present_fit(DrmContext *ctx, DrmOutput *out,
                               DecodedFrame *frame)
@@ -1144,13 +1179,21 @@ static int rgb565_present_fit(DrmContext *ctx, DrmOutput *out,
     uint32_t sw = frame->width;
     uint32_t sh = frame->src_height;
 
-    if (!out->fit_sws || out->fit_src_w != sw || out->fit_src_h != sh) {
-        if (out->fit_sws) sws_freeContext(out->fit_sws);
+    if (!frame->pixels) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "drm: fit mode needs a CPU-mapped decode buffer "
+                            "(mmap failed) — try --spi-fill\n");
+            warned = 1;
+        }
+        return -1;
+    }
 
+    if (!out->fit_xmap || out->fit_src_w != sw || out->fit_src_h != sh) {
         double ar_src = (double)sw / (double)sh;
         double ar_pan = (double)out->mode_w / (double)out->mode_h;
         uint32_t dw, dh;
-        if (ar_src >= ar_pan) {          /* wider than panel — pillar top/bottom */
+        if (ar_src >= ar_pan) {          /* wider than panel — bars top/bottom */
             dw = out->mode_w;
             dh = (uint32_t)((double)out->mode_w / ar_src + 0.5);
         } else {                          /* taller — bars left/right */
@@ -1167,52 +1210,28 @@ static int rgb565_present_fit(DrmContext *ctx, DrmOutput *out,
         out->fit_dx = (out->mode_w - out->fit_dw) / 2;
         out->fit_dy = (out->mode_h - out->fit_dh) / 2;
 
-        out->fit_sws = sws_getContext((int)sw, (int)sh, AV_PIX_FMT_RGB565LE,
-                                      (int)out->fit_dw, (int)out->fit_dh,
-                                      AV_PIX_FMT_RGB565LE,
-                                      SWS_POINT, NULL, NULL, NULL);
-        if (!out->fit_sws) {
-            fprintf(stderr, "drm: fit sws_getContext failed\n");
-            return -1;
-        }
+        free(out->fit_xmap);
+        out->fit_xmap = malloc((out->fit_dw + 1) * sizeof(uint16_t));
+        if (!out->fit_xmap) { perror("drm: fit xmap"); return -1; }
+        for (uint32_t x = 0; x <= out->fit_dw; x++)
+            out->fit_xmap[x] = (uint16_t)((x * sw) / out->fit_dw);
+
         out->fit_src_w = sw;
         out->fit_src_h = sh;
         memset(out->fit_map, 0, out->fit_size);   /* re-clear bars */
+        out->fit_need_full = 1;                   /* repaint bars this frame */
         vlog("drm: fit %ux%u -> %ux%u at (%u,%u)\n", sw, sh,
              out->fit_dw, out->fit_dh, out->fit_dx, out->fit_dy);
     }
 
-    size_t map_len = frame->cap_size ? frame->cap_size
-                                     : (size_t)frame->stride * frame->height;
-    void *src = mmap(NULL, map_len, PROT_READ, MAP_SHARED, frame->dmabuf_fd, 0);
-    if (src == MAP_FAILED) {
-        perror("drm: fit mmap decoded frame");
-        return -1;
+    if (out->fit_linebuf_sz < frame->stride) {
+        free(out->fit_linebuf);
+        out->fit_linebuf = malloc(frame->stride);
+        if (!out->fit_linebuf) { perror("drm: fit linebuf"); out->fit_linebuf_sz = 0; return -1; }
+        out->fit_linebuf_sz = frame->stride;
     }
-    dmabuf_cpu_sync(frame->dmabuf_fd, 1);
 
-    const uint8_t *sp[4] = { src, NULL, NULL, NULL };
-    int            ss[4] = { (int)frame->stride, 0, 0, 0 };
-    uint8_t       *dp[4] = {
-        (uint8_t *)out->fit_map + (size_t)out->fit_dy * out->fit_pitch
-                                + (size_t)out->fit_dx * 2,
-        NULL, NULL, NULL
-    };
-    int            ds[4] = { (int)out->fit_pitch, 0, 0, 0 };
-    sws_scale(out->fit_sws, sp, ss, 0, (int)sh, dp, ds);
-
-    dmabuf_cpu_sync(frame->dmabuf_fd, 0);
-    munmap(src, map_len);
-
-    uint32_t handles[4] = { out->fit_gem,  0, 0, 0 };
-    uint32_t pitches[4] = { out->fit_pitch, 0, 0, 0 };
-    uint32_t offsets[4] = { 0, 0, 0, 0 };
-    uint32_t fb_id = 0;
-    if (drmModeAddFB2(ctx->fd, out->mode_w, out->mode_h, DRM_FORMAT_RGB565,
-                       handles, pitches, offsets, &fb_id, 0) < 0) {
-        perror("drm: fit AddFB2");
-        return -1;
-    }
+    fit_scale(out, frame->pixels, frame->stride, sh);
 
     out->dest_x = 0;
     out->dest_y = 0;
@@ -1222,21 +1241,37 @@ static int rgb565_present_fit(DrmContext *ctx, DrmOutput *out,
     int need_modeset = out->first_frame ||
                        (out->current_format != DRM_FORMAT_RGB565);
 
-    if (do_atomic_commit(ctx->fd, out, fb_id, 0, 0,
-                          out->mode_w, out->mode_h, need_modeset) < 0) {
+    /* Flush only the image rect once the static bars are painted. */
+    uint32_t damage_blob = 0;
+    if (!need_modeset && !out->fit_need_full && out->prop_fb_damage_clips) {
+        struct drm_mode_rect rect = {
+            .x1 = (int32_t)out->fit_dx,
+            .y1 = (int32_t)out->fit_dy,
+            .x2 = (int32_t)(out->fit_dx + out->fit_dw),
+            .y2 = (int32_t)(out->fit_dy + out->fit_dh),
+        };
+        drmModeCreatePropertyBlob(ctx->fd, &rect, sizeof(rect), &damage_blob);
+    }
+
+    int ret = do_atomic_commit(ctx->fd, out, out->fit_fb_id, 0, 0,
+                               out->mode_w, out->mode_h, damage_blob,
+                               need_modeset);
+    if (damage_blob)
+        drmModeDestroyPropertyBlob(ctx->fd, damage_blob);
+
+    if (ret < 0) {
         perror("drm: atomic commit (rgb565 fit)");
-        drmModeRmFB(ctx->fd, fb_id);
         return -1;
     }
 
     out->first_frame    = 0;
+    out->fit_need_full  = 0;
     out->current_format = DRM_FORMAT_RGB565;
 
-    /* RmFB the previous frame's wrapper; the GEM behind it is persistent. */
+    /* Persistent buffer — drop any framebuffer left over from crop mode. */
     release_prev(ctx->fd, out);
-    out->prev_fb_id      = fb_id;
+    out->prev_fb_id      = 0;
     out->prev_gem_handle = 0;
-    out->prev_is_dumb    = 0;
     return 0;
 }
 
@@ -1302,7 +1337,7 @@ int drm_present(DrmContext *ctx, int output_idx, DecodedFrame *frame)
                        (out->current_format != DRM_FORMAT_NV12);
 
     ret = do_atomic_commit(ctx->fd, out, fb_id, 0, 0,
-                           frame->width, frame->src_height, need_modeset);
+                           frame->width, frame->src_height, 0, need_modeset);
     if (ret < 0) {
         perror("drm: atomic commit failed");
         drmModeRmFB(ctx->fd, fb_id);
@@ -1384,7 +1419,7 @@ int drm_present_image(DrmContext *ctx, int output_idx,
                        (out->current_format != DRM_FORMAT_XRGB8888);
 
     if (do_atomic_commit(ctx->fd, out, fb_id, 0, 0,
-                          (uint32_t)width, (uint32_t)height,
+                          (uint32_t)width, (uint32_t)height, 0,
                           need_modeset) < 0) {
         perror("drm: atomic commit image");
         drmModeRmFB(ctx->fd, fb_id);
@@ -1462,8 +1497,10 @@ void drm_close(DrmContext *ctx)
         release_prev(ctx->fd, out);
 
         /* Fit-mode scratch buffer + scaler */
-        if (out->fit_sws) { sws_freeContext(out->fit_sws); out->fit_sws = NULL; }
+        free(out->fit_xmap);    out->fit_xmap = NULL;
+        free(out->fit_linebuf); out->fit_linebuf = NULL; out->fit_linebuf_sz = 0;
         if (out->fit_map) { munmap(out->fit_map, out->fit_size); out->fit_map = NULL; }
+        if (out->fit_fb_id) { drmModeRmFB(ctx->fd, out->fit_fb_id); out->fit_fb_id = 0; }
         if (out->fit_gem) {
             struct drm_mode_destroy_dumb d = { .handle = out->fit_gem };
             drmIoctl(ctx->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &d);
