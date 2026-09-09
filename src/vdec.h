@@ -2,6 +2,7 @@
 #define VDEC_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <linux/videodev2.h>
 #include <libavcodec/bsf.h>
 #include <libavcodec/avcodec.h>
@@ -18,6 +19,7 @@ typedef struct {
     uint32_t    stride;     /* padded buffer width from driver */
     uint32_t    height;
     uint32_t    src_height;
+    const uint8_t *pixels;  /* CPU-mapped capture buffer (cached), or NULL */
     int         sar_num;
     int         sar_den;
     int64_t     pts_us;
@@ -47,6 +49,8 @@ typedef struct {
     uint32_t        orig_height;
     uint32_t        cap_buf_size;
     int             cap_dmabuf_fd[VDEC_CAPTURE_BUFS];
+    void           *cap_mem[VDEC_CAPTURE_BUFS];   /* cached CPU mmap, for fit-mode scaling */
+    size_t          cap_mem_len;
 
     int             fmt_negotiated;
 

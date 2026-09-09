@@ -139,6 +139,10 @@ static int handle_source_change(VdecContext *ctx)
     xioctl(ctx->fd, VIDIOC_STREAMOFF, &type);
 
     for (int i = 0; i < VDEC_CAPTURE_BUFS; i++) {
+        if (ctx->cap_mem[i]) {
+            munmap(ctx->cap_mem[i], ctx->cap_mem_len);
+            ctx->cap_mem[i] = NULL;
+        }
         if (ctx->cap_dmabuf_fd[i] > 0) {
             close(ctx->cap_dmabuf_fd[i]);
             ctx->cap_dmabuf_fd[i] = -1;
@@ -201,6 +205,13 @@ static int handle_source_change(VdecContext *ctx)
             perror("vdec: VIDIOC_QUERYBUF CAPTURE");
             return -1;
         }
+
+        ctx->cap_mem[i] = mmap(NULL, plane.length, PROT_READ, MAP_SHARED,
+                               ctx->fd, plane.m.mem_offset);
+        if (ctx->cap_mem[i] == MAP_FAILED)
+            ctx->cap_mem[i] = NULL;
+        else
+            ctx->cap_mem_len = plane.length;
 
         struct v4l2_exportbuffer expbuf;
         memset(&expbuf, 0, sizeof(expbuf));
@@ -432,6 +443,13 @@ int vdec_open(VdecContext *ctx, AVStream *stream,
             buf.length   = 1;
             if (xioctl(ctx->fd, VIDIOC_QUERYBUF, &buf) < 0) continue;
 
+            ctx->cap_mem[i] = mmap(NULL, plane.length, PROT_READ, MAP_SHARED,
+                                   ctx->fd, plane.m.mem_offset);
+            if (ctx->cap_mem[i] == MAP_FAILED)
+                ctx->cap_mem[i] = NULL;
+            else
+                ctx->cap_mem_len = plane.length;
+
             struct v4l2_exportbuffer expbuf;
             memset(&expbuf, 0, sizeof(expbuf));
             expbuf.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -602,6 +620,7 @@ void vdec_run(VdecContext *ctx)
                         frame->stride     = ctx->stride;
                         frame->height     = ctx->height;
                         frame->src_height = ctx->orig_height;
+                        frame->pixels     = ctx->cap_mem[buf.index];
                         frame->sar_num    = ctx->sar_num;
                         frame->sar_den    = ctx->sar_den;
                         frame->pts_us     = (int64_t)buf.timestamp.tv_sec * 1000000LL
@@ -718,6 +737,10 @@ int vdec_flush(VdecContext *ctx)
 
     /* Free existing capture buffers */
     for (int i = 0; i < VDEC_CAPTURE_BUFS; i++) {
+        if (ctx->cap_mem[i]) {
+            munmap(ctx->cap_mem[i], ctx->cap_mem_len);
+            ctx->cap_mem[i] = NULL;
+        }
         if (ctx->cap_dmabuf_fd[i] > 0) {
             close(ctx->cap_dmabuf_fd[i]);
             ctx->cap_dmabuf_fd[i] = -1;
@@ -768,6 +791,10 @@ void vdec_close(VdecContext *ctx)
     }
 
     for (int i = 0; i < VDEC_CAPTURE_BUFS; i++) {
+        if (ctx->cap_mem[i]) {
+            munmap(ctx->cap_mem[i], ctx->cap_mem_len);
+            ctx->cap_mem[i] = NULL;
+        }
         if (ctx->cap_dmabuf_fd[i] > 0) {
             close(ctx->cap_dmabuf_fd[i]);
             ctx->cap_dmabuf_fd[i] = -1;

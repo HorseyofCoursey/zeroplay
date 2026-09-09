@@ -8,9 +8,13 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <sys/select.h>
+#include <linux/dma-buf.h>
 #include <drm_fourcc.h>
 #include <drm_mode.h>
+#include <libswscale/swscale.h>
+#include <libavutil/pixfmt.h>
 
 #ifdef HAVE_FREETYPE
 #include <ft2build.h>
@@ -18,6 +22,7 @@
 #endif
 
 int g_drm_spi_panel = 0;
+int g_spi_fill      = 0;   /* 1 = crop-to-fill instead of the default fit */
 
 /* ------------------------------------------------------------------ */
 /* Bitmap font — public domain 8x8, chars 0x20-0x7E                   */
@@ -985,7 +990,8 @@ int drm_open(DrmContext *ctx)
      * straight to RGB565 and use the centre-crop present path. */
     g_drm_spi_panel = (ctx->outputs[0].plane_format == DRM_FORMAT_RGB565);
     if (g_drm_spi_panel)
-        vlog("drm: SPI/DBI panel detected — RGB565 decode + centre-crop\n");
+        vlog("drm: SPI/DBI panel detected — RGB565 decode + %s\n",
+             g_spi_fill ? "crop-to-fill" : "aspect-fit");
 
 #ifdef HAVE_FREETYPE
     ft_init();
@@ -996,13 +1002,19 @@ int drm_open(DrmContext *ctx)
 
 /* ------------------------------------------------------------------ */
 
+static void dmabuf_cpu_sync(int fd, int start)
+{
+    struct dma_buf_sync s;
+    s.flags = (start ? DMA_BUF_SYNC_START : DMA_BUF_SYNC_END) | DMA_BUF_SYNC_READ;
+    ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);   /* best-effort; -ENOTTY is harmless */
+}
+
 /*
- * Present an RGB565 decoded frame on an SPI/DBI panel.
- * The panel plane cannot scale or be repositioned, so the frame must be at
- * least panel-sized and we display a panel-sized window centred in it
- * (requires the drm/mipi-dbi source-offset support).
+ * SPI/DBI crop-to-fill: display a panel-sized window of the (larger) decoded
+ * frame, zero-copy, positioned by the plane source offset. Requires the
+ * drm/mipi-dbi source-offset support and a source at least panel-sized.
  */
-static int drm_present_rgb565(DrmContext *ctx, DrmOutput *out,
+static int rgb565_present_crop(DrmContext *ctx, DrmOutput *out,
                                DecodedFrame *frame)
 {
     uint32_t vis_w = frame->width;
@@ -1012,8 +1024,8 @@ static int drm_present_rgb565(DrmContext *ctx, DrmOutput *out,
         static int warned = 0;
         if (!warned) {
             fprintf(stderr,
-                "drm: frame %ux%u smaller than panel %ux%u — SPI crop path "
-                "needs a source at least panel-sized\n",
+                "drm: frame %ux%u smaller than panel %ux%u — --spi-fill needs "
+                "a source at least panel-sized; use the default fit mode\n",
                 vis_w, vis_h, out->mode_w, out->mode_h);
             warned = 1;
         }
@@ -1070,6 +1082,170 @@ static int drm_present_rgb565(DrmContext *ctx, DrmOutput *out,
     out->prev_gem_handle = gem_handle;
     out->prev_is_dumb    = 0;
     return 0;
+}
+
+/* One-time: a persistent panel-sized RGB565 dumb buffer for fit mode. A fresh
+ * fb_id wrapping it is registered per present so the damage helper always sees
+ * the plane as dirty and re-flushes; the GEM + mmap stay put. */
+static int fit_buffer_alloc(int fd, DrmOutput *out)
+{
+    struct drm_mode_create_dumb creq;
+    memset(&creq, 0, sizeof(creq));
+    creq.width  = out->mode_w;
+    creq.height = out->mode_h;
+    creq.bpp    = 16;
+    if (drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0) {
+        perror("drm: fit CREATE_DUMB");
+        return -1;
+    }
+
+    struct drm_mode_map_dumb mreq;
+    memset(&mreq, 0, sizeof(mreq));
+    mreq.handle = creq.handle;
+    if (drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) < 0) {
+        perror("drm: fit MAP_DUMB");
+        goto err;
+    }
+
+    void *map = mmap(NULL, creq.size, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, fd, mreq.offset);
+    if (map == MAP_FAILED) {
+        perror("drm: fit mmap");
+        goto err;
+    }
+
+    memset(map, 0, creq.size);       /* black letterbox */
+    out->fit_gem   = creq.handle;
+    out->fit_pitch = creq.pitch;
+    out->fit_size  = creq.size;
+    out->fit_map   = map;
+    return 0;
+
+err:
+    {
+        struct drm_mode_destroy_dumb d = { .handle = creq.handle };
+        drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &d);
+    }
+    return -1;
+}
+
+/*
+ * SPI/DBI aspect-fit (default): CPU-scale the decoded frame to fit the panel
+ * with black bars, into a persistent panel-sized buffer, present it 1:1.
+ * Nearest-neighbour (SWS_POINT) keeps this cheap enough for a Pi Zero.
+ * Works with any source size and needs no kernel source-offset support.
+ */
+static int rgb565_present_fit(DrmContext *ctx, DrmOutput *out,
+                              DecodedFrame *frame)
+{
+    if (!out->fit_map && fit_buffer_alloc(ctx->fd, out) < 0)
+        return -1;
+
+    uint32_t sw = frame->width;
+    uint32_t sh = frame->src_height;
+
+    if (!out->fit_sws || out->fit_src_w != sw || out->fit_src_h != sh) {
+        if (out->fit_sws) sws_freeContext(out->fit_sws);
+
+        double ar_src = (double)sw / (double)sh;
+        double ar_pan = (double)out->mode_w / (double)out->mode_h;
+        uint32_t dw, dh;
+        if (ar_src >= ar_pan) {          /* wider than panel — pillar top/bottom */
+            dw = out->mode_w;
+            dh = (uint32_t)((double)out->mode_w / ar_src + 0.5);
+        } else {                          /* taller — bars left/right */
+            dh = out->mode_h;
+            dw = (uint32_t)((double)out->mode_h * ar_src + 0.5);
+        }
+        if (dw < 2) dw = 2;
+        if (dh < 2) dh = 2;
+        if (dw > out->mode_w) dw = out->mode_w;
+        if (dh > out->mode_h) dh = out->mode_h;
+
+        out->fit_dw = dw & ~1u;
+        out->fit_dh = dh & ~1u;
+        out->fit_dx = (out->mode_w - out->fit_dw) / 2;
+        out->fit_dy = (out->mode_h - out->fit_dh) / 2;
+
+        out->fit_sws = sws_getContext((int)sw, (int)sh, AV_PIX_FMT_RGB565LE,
+                                      (int)out->fit_dw, (int)out->fit_dh,
+                                      AV_PIX_FMT_RGB565LE,
+                                      SWS_POINT, NULL, NULL, NULL);
+        if (!out->fit_sws) {
+            fprintf(stderr, "drm: fit sws_getContext failed\n");
+            return -1;
+        }
+        out->fit_src_w = sw;
+        out->fit_src_h = sh;
+        memset(out->fit_map, 0, out->fit_size);   /* re-clear bars */
+        vlog("drm: fit %ux%u -> %ux%u at (%u,%u)\n", sw, sh,
+             out->fit_dw, out->fit_dh, out->fit_dx, out->fit_dy);
+    }
+
+    size_t map_len = frame->cap_size ? frame->cap_size
+                                     : (size_t)frame->stride * frame->height;
+    void *src = mmap(NULL, map_len, PROT_READ, MAP_SHARED, frame->dmabuf_fd, 0);
+    if (src == MAP_FAILED) {
+        perror("drm: fit mmap decoded frame");
+        return -1;
+    }
+    dmabuf_cpu_sync(frame->dmabuf_fd, 1);
+
+    const uint8_t *sp[4] = { src, NULL, NULL, NULL };
+    int            ss[4] = { (int)frame->stride, 0, 0, 0 };
+    uint8_t       *dp[4] = {
+        (uint8_t *)out->fit_map + (size_t)out->fit_dy * out->fit_pitch
+                                + (size_t)out->fit_dx * 2,
+        NULL, NULL, NULL
+    };
+    int            ds[4] = { (int)out->fit_pitch, 0, 0, 0 };
+    sws_scale(out->fit_sws, sp, ss, 0, (int)sh, dp, ds);
+
+    dmabuf_cpu_sync(frame->dmabuf_fd, 0);
+    munmap(src, map_len);
+
+    uint32_t handles[4] = { out->fit_gem,  0, 0, 0 };
+    uint32_t pitches[4] = { out->fit_pitch, 0, 0, 0 };
+    uint32_t offsets[4] = { 0, 0, 0, 0 };
+    uint32_t fb_id = 0;
+    if (drmModeAddFB2(ctx->fd, out->mode_w, out->mode_h, DRM_FORMAT_RGB565,
+                       handles, pitches, offsets, &fb_id, 0) < 0) {
+        perror("drm: fit AddFB2");
+        return -1;
+    }
+
+    out->dest_x = 0;
+    out->dest_y = 0;
+    out->dest_w = out->mode_w;
+    out->dest_h = out->mode_h;
+
+    int need_modeset = out->first_frame ||
+                       (out->current_format != DRM_FORMAT_RGB565);
+
+    if (do_atomic_commit(ctx->fd, out, fb_id, 0, 0,
+                          out->mode_w, out->mode_h, need_modeset) < 0) {
+        perror("drm: atomic commit (rgb565 fit)");
+        drmModeRmFB(ctx->fd, fb_id);
+        return -1;
+    }
+
+    out->first_frame    = 0;
+    out->current_format = DRM_FORMAT_RGB565;
+
+    /* RmFB the previous frame's wrapper; the GEM behind it is persistent. */
+    release_prev(ctx->fd, out);
+    out->prev_fb_id      = fb_id;
+    out->prev_gem_handle = 0;
+    out->prev_is_dumb    = 0;
+    return 0;
+}
+
+static int drm_present_rgb565(DrmContext *ctx, DrmOutput *out,
+                              DecodedFrame *frame)
+{
+    if (g_spi_fill)
+        return rgb565_present_crop(ctx, out, frame);
+    return rgb565_present_fit(ctx, out, frame);
 }
 
 int drm_present(DrmContext *ctx, int output_idx, DecodedFrame *frame)
@@ -1284,6 +1460,15 @@ void drm_close(DrmContext *ctx)
         }
 
         release_prev(ctx->fd, out);
+
+        /* Fit-mode scratch buffer + scaler */
+        if (out->fit_sws) { sws_freeContext(out->fit_sws); out->fit_sws = NULL; }
+        if (out->fit_map) { munmap(out->fit_map, out->fit_size); out->fit_map = NULL; }
+        if (out->fit_gem) {
+            struct drm_mode_destroy_dumb d = { .handle = out->fit_gem };
+            drmIoctl(ctx->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &d);
+            out->fit_gem = 0;
+        }
 
         if (out->mode_blob_id) {
             drmModeDestroyPropertyBlob(ctx->fd, out->mode_blob_id);

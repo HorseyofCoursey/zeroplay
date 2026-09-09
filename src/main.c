@@ -86,6 +86,7 @@ static void print_usage(void)
         "  --yt-quality n          YouTube stream height cap (default: 480)\n"
         "                          e.g. 360, 480, 720, 1080 (requires yt-dlp)\n"
         "  --image-duration n      seconds per image (default 10, 0 = hold forever)\n"
+        "  --spi-fill              SPI/DBI panel: crop video to fill (default: fit with bars)\n"
         "  --verbose               print decoder/driver info\n"
         "  --help                  show this message\n"
         "\n"
@@ -132,6 +133,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
         { "audio-device",     required_argument, NULL, 'a' },
         { "sub",              required_argument, NULL, 's' },
         { "image-duration",   required_argument, NULL, 'd' },
+        { "spi-fill",         no_argument,       NULL, 'F' },
         { "verbose",          no_argument,       NULL, 'V' },
         { "control",          no_argument,       NULL, 'C' },
         { "hls-bitrate",      required_argument, NULL, 'B' },
@@ -155,6 +157,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
             case 'a': opt->audio_device      = optarg;       break;
             case 's': opt->sub_path          = optarg;       break;
             case 'd': opt->image_duration_s  = atof(optarg); break;
+            case 'F': g_spi_fill             = 1;            break;
             case 'V': g_verbose              = 1;            break;
             case 'C': opt->control           = 1;            break;
             case 'B': opt->hls_max_bandwidth = atoll(optarg); break;

@@ -34,6 +34,16 @@ typedef struct {
     /* DRM_FORMAT_NV12 (scaled path) or DRM_FORMAT_RGB565 (SPI/DBI crop path) */
     uint32_t plane_format;
 
+    /* SPI/DBI fit mode: a persistent panel-sized RGB565 buffer that the
+     * decoded frame is aspect-fit-scaled into (letterboxed) each present. */
+    uint32_t           fit_gem;
+    uint32_t           fit_pitch;
+    size_t             fit_size;
+    void              *fit_map;
+    struct SwsContext *fit_sws;
+    uint32_t           fit_src_w, fit_src_h;   /* source size fit_sws was built for */
+    uint32_t           fit_dx, fit_dy, fit_dw, fit_dh;  /* scaled rect in the panel */
+
     /* Aspect-correct destination rectangle */
     uint32_t dest_x;
     uint32_t dest_y;
@@ -92,6 +102,9 @@ typedef struct {
  * drm_present() centre-crops a panel-sized window instead of scaling.
  */
 extern int g_drm_spi_panel;
+
+/* SPI/DBI panels only: 0 = aspect-fit (letterbox, default), 1 = crop-to-fill. */
+extern int g_spi_fill;
 
 int  drm_open(DrmContext *ctx);
 
