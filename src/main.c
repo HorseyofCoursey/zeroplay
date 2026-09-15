@@ -1147,8 +1147,17 @@ static int run_control_mode(Options *opt)
                 current_path[0] = '\0';
                 paused          = 0;
             }else if (strcmp(cmd, "seek") == 0) {
+
+                char *end;
+                long long value = strtoll(arg, &end, 10);
+
+                if (end == arg || *end != '\0') {
+                    fprintf(stderr, "zeroplay: %s is not a valid seek value\n",arg);
+                    break;
+                }
+
                 if (player.pipeline_open) {
-                    int64_t target_us = strtoll(arg, NULL, 10) * 1000LL;
+                    int64_t target_us = value * 1000LL;
                     if (target_us < 0) target_us = 0;
                     if (player.duration_us > 0 && target_us > player.duration_us)
                         target_us = player.duration_us;
