@@ -333,6 +333,7 @@ If an initial path is given it auto-loops at startup so the screen is live immed
 | `pause` | Pause playback |
 | `resume` | Resume playback |
 | `stop` | Stop and hold last frame |
+| `seek` | `positionMs` | Seek to position in milliseconds |
 | `quit` | Exit cleanly |
 
 ### Events (stdout)
