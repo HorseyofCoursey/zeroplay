@@ -34,15 +34,6 @@
 #define VIDEO_AUDIO_DESYNC_THRESHOLD_MIN 0.1
 #define VIDEO_AUDIO_DESYNC_EPSILON       0.01
 
-static int get_channels(AVCodecParameters *par)
-{
-#if HAVE_CH_LAYOUT
-    return par->ch_layout.nb_channels;
-#else
-    return par->channels;
-#endif
-}
-
 static int get_frame_channels(AVFrame *frame)
 {
 #if HAVE_CH_LAYOUT
@@ -52,8 +43,6 @@ static int get_frame_channels(AVFrame *frame)
 #endif
 }
 
-// should have fixed downmixing in this function, but unsure if this affects
-// other code or if it is the best place for fix.
 static void set_swr_layout(SwrContext *swr, AVCodecContext *codec_ctx, uint64_t out_channels)
 {
 #if HAVE_CH_LAYOUT
@@ -65,7 +54,6 @@ static void set_swr_layout(SwrContext *swr, AVCodecContext *codec_ctx, uint64_t 
                    : av_get_default_channel_layout(codec_ctx->channels);
     uint64_t out_layout = av_get_default_channel_layout(out_channels);
     av_opt_set_int(swr, "in_channel_layout",  in_layout, 0);
-    fprintf(stderr, "DEBUG: set_swr_layout(): out_layout set to %ld\n", out_layout);  // 6CH
     av_opt_set_int(swr, "out_channel_layout", out_layout, 0);
 #endif
 }
@@ -80,8 +68,9 @@ static void set_swr_layout(SwrContext *swr, AVCodecContext *codec_ctx, uint64_t 
 /* ALSA at the rate it actually runs at — no plughw conversion.        */
 /* ------------------------------------------------------------------ */
 
-static int probe_native_rate(const char *dev_name,
-                             unsigned int target, int channels)
+// changed from probe_native_rate bc it will also probe channel
+// used to fetch actual hw capabilities inaccessible through plughw: layer
+static int probe_device(AudioContext *ctx, const char *dev_name)
 {
     /* Build the raw hw: name from plughw: (or hw: as-is) */
     char hw_name[64];
@@ -89,41 +78,98 @@ static int probe_native_rate(const char *dev_name,
         snprintf(hw_name, sizeof(hw_name), "hw:%s", dev_name + 7);
     else if (strncmp(dev_name, "hw:", 3) == 0)
         snprintf(hw_name, sizeof(hw_name), "%s", dev_name);
-    else
-        return (int)target;   /* unknown device type — keep target */
+    else {
+        fprintf(stderr, "audio: WARN: unknown device type. alsa_rate set to %u. dev_channels set to 2. \n", ctx->sample_rate);
+        ctx->alsa_rate = (int)ctx->sample_rate;
+        ctx->dev_channels = 2;
+        return -1;
+    }
 
     snd_pcm_t *pcm = NULL;
     if (snd_pcm_open(&pcm, hw_name, SND_PCM_STREAM_PLAYBACK, 0) < 0) {
-        fprintf(stderr, "audio: probe — cannot open %s, using %u Hz\n",
-                hw_name, target);
-        return (int)target;
+        fprintf(stderr, "audio: WARN: probe — cannot open %s, using %u Hz and 2CH.\n",
+                hw_name, ctx->sample_rate);
+        ctx->alsa_rate = (int)ctx->sample_rate;
+        ctx->dev_channels = 2;
+        return -1;
     }
 
     snd_pcm_hw_params_t *params;
     snd_pcm_hw_params_alloca(&params);
-    snd_pcm_hw_params_any(pcm, params);
 
-    snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
-    snd_pcm_hw_params_set_format(pcm, params, ALSA_FORMAT);
-    snd_pcm_hw_params_set_channels(pcm, params, (unsigned int)channels);
+    if (snd_pcm_hw_params_any(pcm, params) < 0) {
+        fprintf(stderr, "audio: ERROR: failed to load config space into params.\n");
+        snd_pcm_close(pcm);
+        pcm = NULL;
 
+        ctx->alsa_rate = (int)ctx->sample_rate;
+        ctx->dev_channels = 2;
+        return -1;
+    }
+
+    if (snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED) < 0) {
+        fprintf(stderr, "audio: ERROR setting access mode.\n");
+        snd_pcm_close(pcm);
+        pcm = NULL;
+
+        ctx->alsa_rate = (int)ctx->sample_rate;
+        ctx->dev_channels = 2;
+        return -1;
+    }
+
+    if (snd_pcm_hw_params_set_format(pcm, params, ALSA_FORMAT) < 0) {
+        fprintf(stderr, "audio: device '%s' rejected format %s\n",
+                dev_name, snd_pcm_format_name(ALSA_FORMAT));
+        snd_pcm_close(pcm);
+        pcm = NULL;
+
+        ctx->alsa_rate = (int)ctx->sample_rate;
+        ctx->dev_channels = 2;
+        return -1;
+    }
+
+    unsigned int max_ch = 0;
+    if (snd_pcm_hw_params_get_channels_max(params, &max_ch) < 0) {
+        fprintf(stderr, "audio: ERROR: could not get max channels.\n");
+        snd_pcm_close(pcm);
+        pcm = NULL;
+
+        ctx->alsa_rate = (int)ctx->sample_rate;
+        ctx->dev_channels = 2;
+        return -1;
+    }
+    ctx->dev_channels = max_ch;
+
+    // query ALSA hardware channels
+    if (snd_pcm_hw_params_set_channels_near(pcm, params, &ctx->dev_channels) < 0) {
+        fprintf(stderr, "audio: failed to set channels on '%s'\n", dev_name);
+        snd_pcm_close(pcm);
+        pcm = NULL;
+
+        ctx->alsa_rate = (int)ctx->sample_rate;
+        ctx->dev_channels = 2;
+        return -1;
+    }
+	
+    // rate block
     /* Log supported rate range */
     unsigned int rate_min = 0, rate_max = 0;
     snd_pcm_hw_params_get_rate_min(params, &rate_min, NULL);
     snd_pcm_hw_params_get_rate_max(params, &rate_max, NULL);
 
     /* Find nearest supported rate to our target */
-    unsigned int rate = target;
+    unsigned int rate = ctx->sample_rate;
     int dir = 0;
     snd_pcm_hw_params_set_rate_near(pcm, params, &rate, &dir);
-
+    ctx->alsa_rate = rate;
+    
     snd_pcm_close(pcm);
 
     fprintf(stderr, "audio: hw probe %s — hw rates %u..%u Hz, "
             "target=%u → nearest=%u\n",
-            hw_name, rate_min, rate_max, target, rate);
+            hw_name, rate_min, rate_max, ctx->sample_rate, rate);
 
-    return (int)rate;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -133,7 +179,6 @@ static int probe_native_rate(const char *dev_name,
 static int alsa_setup_device(AudioContext *ctx, const char *dev_name,
                              snd_pcm_format_t fmt)
 {
-    fprintf(stderr, "DEBUG: audio: alsa_setup_device() started.\n");
     int err;
 
     err = snd_pcm_open(&ctx->pcm, dev_name, SND_PCM_STREAM_PLAYBACK, 0);
@@ -156,8 +201,16 @@ static int alsa_setup_device(AudioContext *ctx, const char *dev_name,
         return -1;
     }
 
-    snd_pcm_hw_params_set_access(ctx->pcm, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    // read-write calls and interleaved audio
+    err = snd_pcm_hw_params_set_access(ctx->pcm, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    if (err < 0) {
+        fprintf(stderr, "audio: ERROR setting access mode.\n");
+        snd_pcm_close(ctx->pcm);
+        ctx->pcm = NULL;
+        return -1;
+    }
 
+    // Sets S16_LE format
     err = snd_pcm_hw_params_set_format(ctx->pcm, hw_params, fmt);
     if (err < 0) {
         fprintf(stderr, "audio: device '%s' rejected format %s: %s\n",
@@ -167,8 +220,8 @@ static int alsa_setup_device(AudioContext *ctx, const char *dev_name,
         return -1;
     }
 
-    unsigned int actual_ch = 2;
-    // query ALSA hardware channels
+    // set actual_ch to min(src_channels, dev_channels).
+    unsigned int actual_ch = (ctx->src_channels <= ctx->dev_channels) ? ctx->src_channels : ctx->dev_channels;
     err = snd_pcm_hw_params_set_channels_near(ctx->pcm, hw_params, &actual_ch);
     if (err < 0) {
         fprintf(stderr, "audio: failed to set channels on '%s': %s\n", dev_name, snd_strerror(err));
@@ -176,8 +229,7 @@ static int alsa_setup_device(AudioContext *ctx, const char *dev_name,
         ctx->pcm = NULL;
         return -1;
     }
-
-    ctx->channels = (int)actual_ch;
+    ctx->dev_channels = actual_ch;
 
     unsigned int rate = (unsigned int)ctx->alsa_rate;
     snd_pcm_hw_params_set_rate_near(ctx->pcm, hw_params, &rate, 0);
@@ -221,7 +273,6 @@ static int alsa_setup_device(AudioContext *ctx, const char *dev_name,
             snd_pcm_format_name(actual_fmt),
             (unsigned long)actual_buffer, (unsigned long)actual_period);
 
-    fprintf(stderr, "DEBUG: audio: alsa_setup_device() finished.\n");
     return 0;
 }
 
@@ -265,14 +316,11 @@ int audio_open(AudioContext *ctx, AVStream *stream,
 
     ctx->audio_queue    = audio_queue;
     ctx->sample_rate    = stream->codecpar->sample_rate;
-    // is this right? shouldn't it be device channels?
-    ctx->channels       = 2;
     ctx->time_base      = stream->time_base;
     ctx->frames_written = 0;
     ctx->paused         = 0;
     ctx->volume         = 1.0f;
     ctx->muted          = 0;
-
     ctx->video_pts      = NULL;
     ctx->audio_pts      = 0;
 
@@ -311,57 +359,52 @@ int audio_open(AudioContext *ctx, AVStream *stream,
             if (snd_pcm_open(&test, try_devices[i],
                              SND_PCM_STREAM_PLAYBACK, 0) == 0) {
                 snd_pcm_close(test);
-                strncpy(ctx->device, try_devices[i],
-                        sizeof(ctx->device) - 1);
-                vlog("audio: selected device '%s'\n",
-                        ctx->device);
+                strncpy(ctx->device, try_devices[i], sizeof(ctx->device) - 1);
+                vlog("audio: selected device '%s'\n", ctx->device);
                 break;
             }
         }
         if (!ctx->device[0]) {
-            fprintf(stderr, "audio: no HDMI audio device found\n");
+            fprintf(stderr, "audio: no audio device found\n");
             return -1;
         }
     }
 
     /* ------------------------------------------------------------------ */
-    /* 0. Probe hardware native rate so we can bypass plughw resampling    */
+    /* 0. Probe hardware device so we can bypass plughw layer             */
     /* ------------------------------------------------------------------ */
-    ctx->alsa_rate = probe_native_rate(ctx->device,
-                                       (unsigned int)ctx->sample_rate,
-                                       ctx->channels);
+    probe_device(ctx, device);
 
     /* ------------------------------------------------------------------ */
-    /* 1. Initialise libavcodec audio decoder                              */
+    /* 1. Initialise libavcodec audio decoder                             */
     /* ------------------------------------------------------------------ */
     const AVCodec *codec = avcodec_find_decoder(stream->codecpar->codec_id);
     if (!codec) {
         fprintf(stderr, "audio: no decoder for audio codec\n");
         return -1;
     }
-
     ctx->codec_ctx = avcodec_alloc_context3(codec);
     if (!ctx->codec_ctx) {
         fprintf(stderr, "audio: failed to alloc codec context\n");
         return -1;
     }
-
     if (avcodec_parameters_to_context(ctx->codec_ctx,
                                       stream->codecpar) < 0) {
         fprintf(stderr, "audio: failed to copy codec parameters\n");
         return -1;
     }
-
     if (avcodec_open2(ctx->codec_ctx, codec, NULL) < 0) {
         fprintf(stderr, "audio: failed to open codec\n");
         return -1;
     }
 
+    ctx->src_channels = ctx->codec_ctx->channels;
+
     vlog("audio: decoder opened — %s profile=%d codecpar_rate=%d "
             "codec_ctx_rate=%d ch=%d (fmt=%s)\n",
             codec->name, ctx->codec_ctx->profile,
             ctx->sample_rate, ctx->codec_ctx->sample_rate,
-            ctx->channels,
+            ctx->src_channels,
             av_get_sample_fmt_name(ctx->codec_ctx->sample_fmt));
 
     /* If the codec context reports a different rate after open (e.g.
@@ -375,7 +418,13 @@ int audio_open(AudioContext *ctx, AVStream *stream,
     }
 
     /* ------------------------------------------------------------------ */
-    /* 2. Initialise swresample: float-planar → S16 interleaved            */
+    /* 2. Open ALSA PCM device                                            */
+    /* ------------------------------------------------------------------ */
+    if (alsa_open_device(ctx) < 0)
+        return -1;
+
+    /* ------------------------------------------------------------------ */
+    /* 3. Initialise swresample: float-planar → S16 interleaved           */
     /* ------------------------------------------------------------------ */
     ctx->swr_ctx = swr_alloc();
     if (!ctx->swr_ctx) {
@@ -383,7 +432,8 @@ int audio_open(AudioContext *ctx, AVStream *stream,
         return -1;
     }
 
-    set_swr_layout(ctx->swr_ctx, ctx->codec_ctx, ctx->channels);
+    // has to be fed device channels
+    set_swr_layout(ctx->swr_ctx, ctx->codec_ctx, ctx->dev_channels);
     av_opt_set_int       (ctx->swr_ctx, "in_sample_rate",
                           ctx->sample_rate, 0);
     av_opt_set_sample_fmt(ctx->swr_ctx, "in_sample_fmt",
@@ -401,12 +451,6 @@ int audio_open(AudioContext *ctx, AVStream *stream,
     if (ctx->alsa_rate != ctx->sample_rate)
         fprintf(stderr, "audio: resampling %d → %d Hz (hw native rate)\n",
                 ctx->sample_rate, ctx->alsa_rate);
-
-    /* ------------------------------------------------------------------ */
-    /* 3. Open ALSA PCM device                                             */
-    /* ------------------------------------------------------------------ */
-    if (alsa_open_device(ctx) < 0)
-        return -1;
 
     return 0;
 }
@@ -462,7 +506,7 @@ void audio_pkt_free(AudioPkt *audioPkt)
 {
     if (!audioPkt) return;
     if (audioPkt->queued)
-        av_packet_free(&audioPkt->queued);
+        av_packet_free(&audioPkt->queued);  // queued is 1 AVPacket
     free(audioPkt);
 }
 
@@ -498,7 +542,7 @@ static void write_silence_chunk(AudioContext *ctx)
     if (frames == 0)
         frames = 1;
 
-    int16_t silence[frames * (unsigned)ctx->channels];
+    int16_t silence[frames * (unsigned)ctx->dev_channels];
     memset(silence, 0, sizeof(silence));
 
     snd_pcm_sframes_t written = snd_pcm_writei(ctx->pcm, silence, frames);
@@ -644,7 +688,7 @@ void audio_run(AudioContext *ctx)
                         ctx->sample_rate, ctx->alsa_rate);
 
                     swr_close(ctx->swr_ctx);
-                    set_swr_layout(ctx->swr_ctx, ctx->codec_ctx, ctx->channels);
+                    set_swr_layout(ctx->swr_ctx, ctx->codec_ctx, ctx->dev_channels);
                     av_opt_set_int(ctx->swr_ctx, "in_sample_rate",
                                    detected, 0);
                     av_opt_set_sample_fmt(ctx->swr_ctx, "in_sample_fmt",
@@ -684,7 +728,7 @@ void audio_run(AudioContext *ctx)
             uint8_t *out_buf    = NULL;
             int      out_linesize = 0;
             av_samples_alloc(&out_buf, &out_linesize,
-                             ctx->channels, out_samples,
+                             ctx->dev_channels, out_samples,
                              AV_OUT_FORMAT, 0);
 
             int converted = swr_convert(ctx->swr_ctx,
@@ -695,7 +739,7 @@ void audio_run(AudioContext *ctx)
             if (converted > 0 && out_buf && ctx->pcm) {
                 /* Apply software volume gain or mute (on S16 data) */
                 int16_t *s16_data = (int16_t *)out_buf;
-                int total_samps = converted * ctx->channels;
+                int total_samps = converted * ctx->dev_channels;
                 float gain = ctx->muted ? 0.0f : ctx->volume;
                 if (gain != 1.0f) {
                     for (int s = 0; s < total_samps; s++) {
@@ -713,7 +757,7 @@ void audio_run(AudioContext *ctx)
 
                 if (pending_start_frame) {
                     pending_start_frame = 0;
-                    apply_fade(s16_data, fade_samples, ctx->channels, /*fade_in=*/1);
+                    apply_fade(s16_data, fade_samples, ctx->dev_channels, /*fade_in=*/1);
                 }
                 if (audioPkt->is_loop_end) {
                     //for seamless looping: if audio is trimmed to video-duration, the last audio-frame is
@@ -731,7 +775,7 @@ void audio_run(AudioContext *ctx)
                     if (fs > converted) fs = converted;
                     int offset_frames = converted - fs;
                     if (offset_frames >= 0)
-                        apply_fade(s16_data + offset_frames * ctx->channels, fs, ctx->channels, /*fade_in=*/0);
+                        apply_fade(s16_data + offset_frames * ctx->dev_channels, fs, ctx->dev_channels, /*fade_in=*/0);
                 }
 
                 snd_pcm_sframes_t written =

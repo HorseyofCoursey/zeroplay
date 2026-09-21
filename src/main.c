@@ -692,8 +692,7 @@ static int player_open_video(PlayerContext *p, const char *filename,
     if (p->no_audio)
         p->demux.audio_stream_idx = -1;
 
-    AVStream *video_stream =
-        p->demux.fmt_ctx->streams[p->demux.video_stream_idx];
+    AVStream *video_stream = p->demux.fmt_ctx->streams[p->demux.video_stream_idx];
 
     if (vdec_open(&p->vdec, video_stream, &p->video_queue, &p->frame_queue) < 0)
         return -1;
@@ -709,9 +708,9 @@ static int player_open_video(PlayerContext *p, const char *filename,
                 p->demux.fmt_ctx->streams[p->demux.audio_stream_idx];
         }
 
-        if (audio_stream && (audio_open(&p->audio, audio_stream,
-                                         opt->audio_device,
-                                         &p->audio_queue) == 0)) {
+        if ( audio_stream && 
+             (audio_open(&p->audio, audio_stream, opt->audio_device, &p->audio_queue) == 0) )
+        {
             p->audio.volume = opt->vol / 100.0f;
             p->audio_active = 1;
 
@@ -1452,7 +1451,6 @@ int main(int argc, char *argv[])
     term_raw();  // change terminal state
     // intercept control-C signal to handle all threads cleanly
     signal(SIGINT,  signal_handler);
-    // signal(SIGTERM, signal_handler);
 
     // input thread should be started first
     pthread_mutex_init(&g_input.mutex, NULL);
