@@ -43,15 +43,27 @@ static int get_frame_channels(AVFrame *frame)
 #endif
 }
 
+static unsigned int get_codec_channels(AVCodecContext *c)
+{
+#if HAVE_CH_LAYOUT
+    return c->ch_layout.nb_channels;
+#else
+    return c->channels;
+#endif
+}
+
 static void set_swr_layout(SwrContext *swr, AVCodecContext *codec_ctx, uint64_t out_channels)
 {
 #if HAVE_CH_LAYOUT
+    // returns default channel layout for given number of channels
+    uint64_t out_layout = av_channel_layout_default(out_channels);  // i think this is right, to test
+    
     av_opt_set_chlayout(swr, "in_chlayout",  &codec_ctx->ch_layout, 0);
-    av_opt_set_chlayout(swr, "out_chlayout", &codec_ctx->ch_layout, 0);  // not changed
+    av_opt_set_chlayout(swr, "out_chlayout", out_layout, 0);
 #else
     uint64_t in_layout = codec_ctx->channel_layout
                    ? codec_ctx->channel_layout
-                   : av_get_default_channel_layout(codec_ctx->channels);
+                   : (uint64_t)av_get_default_channel_layout(codec_ctx->channels);
     uint64_t out_layout = av_get_default_channel_layout(out_channels);
     av_opt_set_int(swr, "in_channel_layout",  in_layout, 0);
     av_opt_set_int(swr, "out_channel_layout", out_layout, 0);
@@ -346,6 +358,7 @@ int audio_open(AudioContext *ctx, AVStream *stream,
     } else {
         /* Try hdmi: first (goes through iec958 plugin), then plughw: */
         static const char *try_devices[] = {
+            "plughw:CARD=Audio,DEV=0",     // name of my audio device
             "hdmi:CARD=vc4hdmi,DEV=0",     /* Pi Zero 2W, Pi 3 */
             "hdmi:CARD=vc4hdmi0,DEV=0",    /* Pi 4 (HDMI port 0) */
             "plughw:CARD=vc4hdmi,DEV=0",   /* fallback */
@@ -373,7 +386,8 @@ int audio_open(AudioContext *ctx, AVStream *stream,
     /* ------------------------------------------------------------------ */
     /* 0. Probe hardware device so we can bypass plughw layer             */
     /* ------------------------------------------------------------------ */
-    probe_device(ctx, device);
+    // changed from device to ctx->device
+    probe_device(ctx, ctx->device);
 
     /* ------------------------------------------------------------------ */
     /* 1. Initialise libavcodec audio decoder                             */
@@ -398,7 +412,7 @@ int audio_open(AudioContext *ctx, AVStream *stream,
         return -1;
     }
 
-    ctx->src_channels = ctx->codec_ctx->channels;
+    ctx->src_channels = get_codec_channels(ctx->codec_ctx);
 
     vlog("audio: decoder opened — %s profile=%d codecpar_rate=%d "
             "codec_ctx_rate=%d ch=%d (fmt=%s)\n",
