@@ -24,8 +24,6 @@ ZeroPlay runs on any Linux device with a V4L2 M2M hardware decoder and DRM/KMS d
 
 Both 32-bit and 64-bit builds are supported. The install script builds from source automatically for the correct architecture.
 
-Small SPI/DBI TFT panels (no HDMI) are also supported — see [SPI/DBI Panels](#spidbi-panels) below.
-
 ---
 
 ## Supported Formats
@@ -115,6 +113,7 @@ Each path can be a video file, image, `.txt`/`.m3u` playlist, directory, URL, or
 | Flag | Description |
 |---|---|
 | `--loop` | Loop playback indefinitely |
+| `--loop-seamless` | Loop a single track indefinitely without a pipeline restart between loops |
 | `--shuffle` | Randomise playlist order |
 | `--recursive` | Load files from folder recursively |
 | `--no-audio` | Disable audio |
@@ -289,7 +288,7 @@ ISP an RGB565 frame instead of NV12, and it's presented on the panel's own plane
 | Mode | Behaviour | Requirements |
 |---|---|---|
 | Fit (default) | Whole picture, letterboxed to the panel's aspect. CPU-scales the decoded frame into a panel-sized buffer. | None — works on any kernel. |
-| `--spi-fill` | Crops to fill the panel edge-to-edge, no CPU scaling (zero-copy: the decoder's own buffer is scanned out directly, cropped by the plane's source rectangle). | Needs the panel's `drm/tiny` driver to accept a framebuffer larger than the panel and honour a non-zero plane source offset — merged in mainline and in `raspberrypi/linux` `rpi-7.2.y`+. On an older kernel this mode will fail to allocate the framebuffer; fit mode still works everywhere. |
+| `--spi-fill` | Crops to fill the panel edge-to-edge, no CPU scaling (zero-copy: the decoder's own buffer is scanned out directly, cropped by the plane's source rectangle). | Needs the panel's `drm/tiny` driver to accept a framebuffer larger than the panel and honour a non-zero plane source offset — merged in `raspberrypi/linux` `rpi-7.2.y`+ and submitted upstream dri-devel, waiting on merge status as of 9/15/26. On an older kernel this mode will fail to allocate the framebuffer; fit mode still works everywhere. |
 
 If the panel can't keep the requested frame rate (a slow SPI clock, a large panel, or
 a high-frame-rate source), ZeroPlay drops late frames rather than falling into slow
@@ -302,6 +301,22 @@ zeroplay movie.mp4
 # Crop to fill the panel (needs a current kernel, see table above)
 zeroplay --spi-fill movie.mp4
 ```
+
+---
+
+## Seamless loop
+
+To play a video file seamlessly and indefinitely, start zeroplay with the `--loop-seamless` flag. Instead of tearing the pipeline down and rebuilding it at the end of every pass, the demuxer seeks back to the start and keeps feeding packets, so there is no gap between loops.
+
+Restriction:
+- Does not support external audio or subtitle files.
+
+MP4 Requirements:
+- If the audio stream is longer than the video stream, it will be trimmed to match the video duration.
+- If the video stream is longer than the audio stream, zeroplay will fail.
+- For best results, ensure the MP4 file has matching audio and video durations.
+
+In `--control` mode the flag applies per clip: `loadloop` loops seamlessly, while `load` plays once and still emits `ended`.
 
 ---
 

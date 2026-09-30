@@ -1,7 +1,11 @@
 #!/bin/bash
 set -e
 
-REPO="https://github.com/HorseyofCoursey/zeroplay.git"
+# Override to install from a fork or a topic branch, e.g.
+#   curl -fsSL .../install.sh | sudo ZEROPLAY_REPO=https://github.com/you/zeroplay.git \
+#                                   ZEROPLAY_BRANCH=my-fix bash
+REPO="${ZEROPLAY_REPO:-https://github.com/HorseyofCoursey/zeroplay.git}"
+BRANCH="${ZEROPLAY_BRANCH:-}"
 BUILD_DIR="/tmp/zeroplay-install"
 
 echo "ZeroPlay installer"
@@ -29,9 +33,9 @@ sudo apt-get install -y \
     libdrm-dev libasound2-dev libcjson-dev libfreetype-dev
 
 # Clone and build
-echo "cloning zeroplay..."
+echo "cloning zeroplay${BRANCH:+ ($BRANCH)}..."
 rm -rf "$BUILD_DIR"
-git clone --depth=1 "$REPO" "$BUILD_DIR"
+git clone --depth=1 ${BRANCH:+--branch "$BRANCH"} "$REPO" "$BUILD_DIR"
 
 echo "building..."
 make -C "$BUILD_DIR" clean

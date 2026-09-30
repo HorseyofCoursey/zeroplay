@@ -7,7 +7,7 @@ CFLAGS += $(shell pkg-config --cflags libavformat libavcodec libavutil libswresa
 CFLAGS += -I/usr/include/libdrm
 
 LIBS    = $(shell pkg-config --libs libavformat libavcodec libavutil libswresample libswscale libdrm 2>/dev/null)
-LIBS   += -lasound -lpthread
+LIBS   += -lasound -lpthread -lm
 
 # FreeType2 subtitle rendering (auto-detected)
 FREETYPE_CFLAGS := $(shell pkg-config --cflags freetype2 2>/dev/null)

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <math.h>
 #include <libavutil/opt.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/version.h>
@@ -388,27 +389,107 @@ int audio_open(AudioContext *ctx, AVStream *stream,
 
 void audio_pause(AudioContext *ctx)
 {
+    /* Note: samples already sitting in the ALSA buffer are left to play
+     * out — see wait_while_paused() for why we don't drop them. */
     pthread_mutex_lock(&ctx->pause_mutex);
     ctx->paused = 1;
     pthread_mutex_unlock(&ctx->pause_mutex);
-
-    /* Drop buffered samples immediately so sound stops now */
-    if (ctx->pcm)
-        snd_pcm_drop(ctx->pcm);
 }
 
 void audio_resume(AudioContext *ctx)
 {
-    /* Prepare ALSA to accept new samples after drop */
-    if (ctx->pcm)
-        snd_pcm_prepare(ctx->pcm);
-
     pthread_mutex_lock(&ctx->pause_mutex);
     ctx->paused = 0;
     pthread_cond_signal(&ctx->pause_cond);
     pthread_mutex_unlock(&ctx->pause_mutex);
 }
 
+/*
+ * Tear-down counterpart to audio_pause(): make audio_run() return as soon as
+ * it can instead of playing the queue out in real time.
+ *
+ * Closing the audio queue is not enough on its own — queue_pop() hands back
+ * every buffered packet before it reports closed, so the thread would keep
+ * decoding and blocking in snd_pcm_writei() for as long as the backlog lasts
+ * (a full 256-packet queue is ~5s of AAC). The caller discards the backlog;
+ * this releases the thread from the two places it can be blocked.
+ *
+ * drop_pcm kills the ~0.2s of samples already handed to the card so an
+ * in-flight snd_pcm_writei() returns immediately. Pass 0 at a natural
+ * end-of-clip, where that tail is the real end of the audio and cutting it
+ * would clip the last fraction of a second.
+ */
+void audio_abort(AudioContext *ctx, int drop_pcm)
+{
+    pthread_mutex_lock(&ctx->pause_mutex);
+    ctx->aborting = 1;
+    ctx->paused   = 0;
+    pthread_cond_signal(&ctx->pause_cond);
+    pthread_mutex_unlock(&ctx->pause_mutex);
+
+    if (drop_pcm && ctx->pcm)
+        snd_pcm_drop(ctx->pcm);
+}
+
+/* Free a queued audio packet and its wrapper. */
+void audio_pkt_free(AudioPkt *audioPkt)
+{
+    if (!audioPkt) return;
+    if (audioPkt->queued)
+        av_packet_free(&audioPkt->queued);
+    free(audioPkt);
+}
+
+static void apply_fade(int16_t *samples, int nsamples, int nchannels, int fade_in /*1=in,0=out*/) {
+    for (int i = 0; i < nsamples; i++) {
+        float g = fade_in ? (float)i / nsamples : 1.0f - (float)i / nsamples;
+        for (int c = 0; c < nchannels; c++)
+            samples[i*nchannels + c] = (int16_t)(samples[i*nchannels + c] * g);
+    }
+}
+
+/*
+ * Amps like the MAX98357A that are wired without a controllable SD_MODE
+ * (ours is tied always-on via the `no-sdmode` overlay param) have no way to
+ * mute themselves. Any time the I2S bit/frame clock stops and restarts cold,
+ * the DAC's clock-recovery has to relock, and that transient comes out as an
+ * audible pop/static burst. audio_pause()/audio_resume() used to call
+ * snd_pcm_drop()/snd_pcm_prepare(), which stops and restarts that clock on
+ * every single pause — so keep the clock running instead: while paused,
+ * feed the card silence instead of blocking outright. Resume then just lets
+ * real samples flow again, with no clock transition at all.
+ *
+ * Also bails out on ctx->aborting, same as the paused case: a pending abort
+ * should release this wait immediately rather than keep feeding silence.
+ */
+static void write_silence_chunk(AudioContext *ctx)
+{
+    if (!ctx->pcm)
+        return;
+
+    /* ~50ms of silence: short enough that resume feels immediate */
+    snd_pcm_uframes_t frames = (snd_pcm_uframes_t)(ctx->alsa_rate / 20);
+    if (frames == 0)
+        frames = 1;
+
+    int16_t silence[frames * (unsigned)ctx->channels];
+    memset(silence, 0, sizeof(silence));
+
+    snd_pcm_sframes_t written = snd_pcm_writei(ctx->pcm, silence, frames);
+    if (written < 0)
+        snd_pcm_recover(ctx->pcm, (int)written, 1);
+}
+
+static void wait_while_paused(AudioContext *ctx)
+{
+    pthread_mutex_lock(&ctx->pause_mutex);
+    while (ctx->paused && !ctx->aborting) {
+        pthread_mutex_unlock(&ctx->pause_mutex);
+        write_silence_chunk(ctx);   /* blocks ~50ms — doubles as the wait */
+        pthread_mutex_lock(&ctx->pause_mutex);
+    }
+    pthread_mutex_unlock(&ctx->pause_mutex);
+}
 /* ------------------------------------------------------------------ */
 
 void audio_run(AudioContext *ctx)
@@ -425,15 +506,17 @@ void audio_run(AudioContext *ctx)
     int rate_checked       = 0;
     int64_t prev_pts       = AV_NOPTS_VALUE;
     int     prev_nb_samples = 0;
+    int pending_start_frame     = 0;
+
+    ctx->aborting = 0;   /* fresh run — a previous abort is history */
 
     vlog("audio: playback thread started\n");
 
     while (1) {
-        /* Block while paused */
-        pthread_mutex_lock(&ctx->pause_mutex);
-        while (ctx->paused)
-            pthread_cond_wait(&ctx->pause_cond, &ctx->pause_mutex);
-        pthread_mutex_unlock(&ctx->pause_mutex);
+        /* Block while paused (feeding silence to keep the I2S clock alive) */
+        wait_while_paused(ctx);
+
+        if (ctx->aborting) break;
 
         void *item = NULL;
         
@@ -442,7 +525,11 @@ void audio_run(AudioContext *ctx)
             break;       /* queue closed — EOS */
 
         /* Decode the packet.  Note: pkt is local — no leak. */
-        AVPacket *pkt = (AVPacket *)item;
+        AudioPkt *audioPkt = (AudioPkt *)item;
+        AVPacket *pkt = (AVPacket *)audioPkt->queued;
+
+        if(audioPkt->is_loop_start && pending_start_frame != 1)
+            pending_start_frame = 1;
 
         /* Block while ahead of video */
         if (ctx->video_pts) {
@@ -465,10 +552,12 @@ void audio_run(AudioContext *ctx)
         }
 
         if (avcodec_send_packet(ctx->codec_ctx, pkt) < 0) {
-            av_packet_free(&pkt);
+            audio_pkt_free(audioPkt);
             continue;
         }
-        av_packet_free(&pkt);
+        /* The wrapper outlives its packet: is_loop_end is read per decoded
+         * frame below, after the packet itself has been handed to the codec. */
+        av_packet_free(&audioPkt->queued);
 
         while (avcodec_receive_frame(ctx->codec_ctx, frame) == 0) {
             total_frames++;
@@ -553,10 +642,15 @@ void audio_run(AudioContext *ctx)
                      total_frames, total_errors, ctx->frames_written);
 
             /* Check pause again between frames */
-            pthread_mutex_lock(&ctx->pause_mutex);
-            while (ctx->paused)
-                pthread_cond_wait(&ctx->pause_cond, &ctx->pause_mutex);
-            pthread_mutex_unlock(&ctx->pause_mutex);
+            wait_while_paused(ctx);
+
+            /* Bail before the write: after a drop, snd_pcm_writei() fails and
+             * the recovery path below would re-prepare the card and play a
+             * fragment of a clip we are in the middle of abandoning. */
+            if (ctx->aborting) {
+                av_frame_unref(frame);
+                break;
+            }
 
             /* Convert to S16 interleaved */
             int out_samples = swr_get_out_samples(ctx->swr_ctx,
@@ -584,6 +678,34 @@ void audio_run(AudioContext *ctx)
                         if (v < -32768) v = -32768;
                         s16_data[s] = (int16_t)v;
                     }
+                }
+
+                //seamless looping: fade out audio on the last frame and in on the first frame again
+                //- smoothes the audio-crack at the end of the video
+                int fade_samples = (int)(ctx->alsa_rate * 0.03);
+                if (fade_samples > converted) fade_samples = converted;
+
+                if (pending_start_frame) {
+                    pending_start_frame = 0;
+                    apply_fade(s16_data, fade_samples, ctx->channels, /*fade_in=*/1);
+                }
+                if (audioPkt->is_loop_end) {
+                    //for seamless looping: if audio is trimmed to video-duration, the last audio-frame is
+                    //most certainly not a full sample long - so cut it where it really should end
+                    int64_t excess_input = audioPkt->last_frame_duration;
+                    if (excess_input < 0) excess_input = 0;
+
+                    double ratio = (double)ctx->alsa_rate / frame->sample_rate;
+                    int excess_output = (int)(excess_input * ratio + 0.5);
+                    if (excess_output > converted) excess_output = converted;
+
+                    converted -= excess_output;   // hard trim to the exact loop boundary
+
+                    int fs = fade_samples;
+                    if (fs > converted) fs = converted;
+                    int offset_frames = converted - fs;
+                    if (offset_frames >= 0)
+                        apply_fade(s16_data + offset_frames * ctx->channels, fs, ctx->channels, /*fade_in=*/0);
                 }
 
                 snd_pcm_sframes_t written =
@@ -638,6 +760,8 @@ void audio_run(AudioContext *ctx)
             av_freep(&out_buf);
             av_frame_unref(frame);
         }
+
+        audio_pkt_free(audioPkt);   /* packet already released above */
     }
 
     if (total_errors)
@@ -670,17 +794,43 @@ long long audio_get_clock_us(AudioContext *ctx)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * Volume steps in dB, not flat percentage. Hearing perceives loudness on a
+ * roughly logarithmic scale, so a fixed +/-10 percentage-point step (the old
+ * behaviour) is nearly inaudible near 100% but leaves nothing between "10%,
+ * still loud" and "0%, silent" at the bottom -- exactly backwards from where
+ * fine control actually matters. Stepping by a fixed dB amount instead makes
+ * every press the same *perceived* loudness change across the whole range.
+ */
+#define VOLUME_STEP_DB     3.0f    /* one step ~= one notch on a TV remote */
+#define VOLUME_MAX_LINEAR  2.0f    /* +6 dB ceiling, unchanged from before */
+#define VOLUME_FLOOR_DB  -40.0f    /* quieter than this, just call it mute */
+
+static float volume_to_db(float linear)
+{
+    /* linear <= 0 has no finite dB value -- treat it as "already at the
+     * floor" so the very next audio_volume_up() step starts climbing back
+     * up from VOLUME_FLOOR_DB instead of computing log10f(0). */
+    if (linear <= 0.0f) return VOLUME_FLOOR_DB;
+    return 20.0f * log10f(linear);
+}
+
 float audio_volume_up(AudioContext *ctx)
 {
-    ctx->volume += 0.1f;
-    if (ctx->volume > 2.0f) ctx->volume = 2.0f;
+    float db = volume_to_db(ctx->volume) + VOLUME_STEP_DB;
+    ctx->volume = powf(10.0f, db / 20.0f);
+    if (ctx->volume > VOLUME_MAX_LINEAR) ctx->volume = VOLUME_MAX_LINEAR;
     return ctx->volume;
 }
 
 float audio_volume_down(AudioContext *ctx)
 {
-    ctx->volume -= 0.1f;
-    if (ctx->volume < 0.0f) ctx->volume = 0.0f;
+    float db = volume_to_db(ctx->volume) - VOLUME_STEP_DB;
+    if (db <= VOLUME_FLOOR_DB) {
+        ctx->volume = 0.0f;
+        return ctx->volume;
+    }
+    ctx->volume = powf(10.0f, db / 20.0f);
     return ctx->volume;
 }
 

@@ -1,9 +1,11 @@
 #include "log.h"
 #include "demux.h"
+#include "audio.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <libavutil/version.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/time.h>
 /* AV_PROFILE_* replaced FF_PROFILE_* in FFmpeg 7.0 (libavcodec 61).
  * Map the new names onto the old ones for Bookworm and earlier. */
 #if LIBAVCODEC_VERSION_MAJOR < 61
@@ -197,18 +199,196 @@ int demux_open(DemuxContext *ctx, const char *filename,
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * A stream's own duration is not always populated. demux_open() caps
+ * probesize and max_analyze_duration to keep startup fast on a Pi, and under
+ * a truncated analysis avformat_find_stream_info() can leave
+ * AVStream::duration at zero or AV_NOPTS_VALUE. The container duration (mvhd
+ * for MP4) is read straight from the header and survives that, so fall back
+ * to it. Returns <= 0 when neither is usable.
+ */
+static double stream_duration_sec(AVFormatContext *fmt, int idx)
+{
+    const AVStream *st = fmt->streams[idx];
+
+    if (st->duration > 0 && st->duration != AV_NOPTS_VALUE)
+        return (double)st->duration * st->time_base.num / st->time_base.den;
+
+    if (fmt->duration > 0 && fmt->duration != AV_NOPTS_VALUE)
+        return (double)fmt->duration / AV_TIME_BASE;
+
+    return -1;
+}
+
+int demux_init_seamless(DemuxContext *ctx)
+{
+    double video_loop_sec = -1;
+    double audio_loop_sec = -1;
+    int audio_frame_ticks = -1;
+
+    ctx->video_rebase           = -1;
+    ctx->audio_rebase           = -1;
+    ctx->audio_rebase_truncated = -1;
+    ctx->sub_rebase             = -1;
+
+    AVRational atb;
+    AVRational stb;
+    AVRational vtb = ctx->fmt_ctx->streams[ctx->video_stream_idx]->time_base;
+
+    /* Needed below for both the audio rebase and the subtitle rebase — compute
+     * it unconditionally so a file with subtitles but no audio track doesn't
+     * fall through with this left unset (which previously made sub_rebase
+     * come out negative, so every subtitle packet looked like it "exceeded
+     * video duration" from the very first one and never showed). */
+    video_loop_sec = stream_duration_sec(ctx->fmt_ctx, ctx->video_stream_idx);
+    if (video_loop_sec <= 0) {
+        fprintf(stderr,
+            "demux: no usable video duration — cannot loop seamlessly.\n");
+        return -1;
+    }
+
+    /* Per-loop PTS advance, back in the video stream's own time_base. */
+    ctx->video_rebase = (int64_t)(video_loop_sec * vtb.den / vtb.num);
+
+    if(ctx->audio_stream_idx != -1){
+        atb = ctx->fmt_ctx->streams[ctx->audio_stream_idx]->time_base;
+
+        AVCodecParameters *acp = ctx->fmt_ctx->streams[ctx->audio_stream_idx]->codecpar;
+
+        audio_frame_ticks = av_get_audio_frame_duration2(acp, 0);
+
+        //fallback
+        if (audio_frame_ticks <= 0)
+            audio_frame_ticks = acp->frame_size;
+
+        /* Codecs with no fixed frame size (PCM) report 0 for both. Quantising
+         * by 0 is a division by zero: SIGFPE on x86, and on ARM it silently
+         * yields 0, which would drop every audio packet. Don't quantise. */
+        if (audio_frame_ticks <= 0)
+            audio_frame_ticks = 1;
+
+        audio_loop_sec = stream_duration_sec(ctx->fmt_ctx, ctx->audio_stream_idx);
+
+        double diff = fabs(video_loop_sec - audio_loop_sec);
+
+        if (diff != 0) {
+            if (video_loop_sec > audio_loop_sec) {
+                // trimming would have to cut video mid-GOP — unsafe, refuse
+                fprintf(stderr,
+                    "demux: video (%.3fs) is longer than audio (%.3fs) by %.3fs. "
+                    "Zeroplay cannot safely trim video content for seamless looping.\n"
+                    "Re-encode/trim the source so audio and video end together. "
+                    "Consult readme for more information.\n",
+                    video_loop_sec, audio_loop_sec, diff);
+                return -1;
+            } else {
+                // audio longer than video — trimming audio, this is safe
+                fprintf(stderr,
+                    "demux: audio (%.3fs) is longer than video (%.3fs). "
+                    "The extra %.3fs of audio will be trimmed for a seamless loop.\n",
+                    audio_loop_sec, video_loop_sec, diff);
+            }
+        }
+
+        /* audio_rebase stays exact (used for the per-loop PTS advance, so
+         * quantising it would drift the two timelines apart a little more on
+         * every loop); audio_rebase_truncated is quantised to a whole number
+         * of frames and used only as the packet-skip/is_loop_end threshold. */
+        ctx->audio_rebase           = (int64_t)(video_loop_sec * atb.den / atb.num);
+        ctx->audio_rebase_truncated = (ctx->audio_rebase / audio_frame_ticks) * audio_frame_ticks;
+    }
+
+    if(ctx->subtitle_stream_idx != -1){
+        stb = ctx->fmt_ctx->streams[ctx->subtitle_stream_idx]->time_base;
+        ctx->sub_rebase = (int64_t)(video_loop_sec * stb.den / stb.num);
+    }
+
+    /* Every packet is dropped or faded against these, so a silently wrong
+     * value costs the whole stream. Log them. */
+    vlog("demux: seamless — video %.3fs (rebase %lld), audio %.3fs "
+         "(rebase %lld, truncated %lld, %d ticks/frame)\n",
+         video_loop_sec, (long long)ctx->video_rebase,
+         audio_loop_sec, (long long)ctx->audio_rebase,
+         (long long)ctx->audio_rebase_truncated, audio_frame_ticks);
+
+    return 0;
+}
+/* ------------------------------------------------------------------ */
+
 void demux_run(DemuxContext *ctx)
 {
+    int64_t loop_pts_base_video = 0;
+    int64_t loop_pts_base_audio = 0;
+    int64_t loop_pts_base_subs = 0;
+    int audio_loop_pending = 0;
+
+    int video_done = 0;
+    int audio_done = (ctx->audio_stream_idx == -1); // no audio stream = done
+
     AVPacket *pkt = av_packet_alloc();
+
     if (!pkt) {
         fprintf(stderr, "demux: failed to allocate packet\n");
         goto done;
     }
 
-    while (av_read_frame(ctx->fmt_ctx, pkt) >= 0) {
+    if(ctx->loop_seamless)
+        if(demux_init_seamless(ctx) < 0)
+            goto done;
+
+    while (1) {
+        int ret = av_read_frame(ctx->fmt_ctx, pkt);
+
+        if (ret == AVERROR_EOF) {
+
+            if(ctx->loop_seamless) {
+
+                if(!(video_done && audio_done)){
+                    fprintf(stderr, "demux: EOF was hit before audio and video-duration were hit\n");
+                    break;
+                }
+
+                video_done = 0;
+                audio_done = (ctx->audio_stream_idx == -1);
+                audio_loop_pending = 1;
+
+                //an unchecked failure here returns EOF again immediately and
+                //spins the loop at 100% CPU
+                if (av_seek_frame(ctx->fmt_ctx, -1, 0, AVSEEK_FLAG_BACKWARD) < 0) {
+                    fprintf(stderr, "demux: seamless loop — seek to start failed, "
+                                    "ending playback\n");
+                    break;
+                }
+
+                loop_pts_base_video += ctx->video_rebase;
+
+                if(ctx->audio_stream_idx != -1)
+                  loop_pts_base_audio += ctx->audio_rebase;
+
+                if(ctx->subtitle_stream_idx != -1)
+                  loop_pts_base_subs += ctx->sub_rebase;
+
+                continue;
+            }
+
+            break;
+          } else if (ret == AVERROR(EAGAIN)) {
+              av_usleep(1000);
+              continue;
+          } else if (ret < 0) {
+              char errbuf[AV_ERROR_MAX_STRING_SIZE];
+              av_strerror(ret, errbuf, sizeof(errbuf));
+              fprintf(stderr, "demux: error reading frame: %i (%s)\n", ret, errbuf);
+              break;
+          }
+
         if (pkt->stream_index == ctx->video_stream_idx) {
-            pkt->pts == AV_NOPTS_VALUE ? -1.0
-            : pkt->pts * av_q2d(ctx->fmt_ctx->streams[ctx->video_stream_idx]->time_base);
+            if (pkt->pts + pkt->duration >= ctx->video_rebase)
+                video_done = 1;
+
+            if (pkt->pts != AV_NOPTS_VALUE) pkt->pts += loop_pts_base_video;
+            if (pkt->dts != AV_NOPTS_VALUE) pkt->dts += loop_pts_base_video;
+
             AVPacket *queued = av_packet_alloc();
             if (!queued) { av_packet_unref(pkt); continue; }
             av_packet_move_ref(queued, pkt);
@@ -217,15 +397,62 @@ void demux_run(DemuxContext *ctx)
                 break;
             }
         } else if (pkt->stream_index == ctx->audio_stream_idx) {
-            AVPacket *queued = av_packet_alloc();
-            if (!queued) { av_packet_unref(pkt); continue; }
-            av_packet_move_ref(queued, pkt);
-            if (!queue_push(ctx->audio_queue, queued)) {
-                av_packet_free(&queued);
+            //seamless loop: skip audio-packets if they exceed video-duration
+            //(checked before allocating, so a skipped packet costs nothing)
+            if (ctx->loop_seamless && pkt->pts >= ctx->audio_rebase_truncated + pkt->duration) {
+                av_packet_unref(pkt);
+                continue;
+            }
+
+            AudioPkt *audioPkt = malloc(sizeof(AudioPkt));
+            if (!audioPkt) { av_packet_unref(pkt); continue; }
+
+            audioPkt->queued = av_packet_alloc();
+            if (!audioPkt->queued) { free(audioPkt); av_packet_unref(pkt); continue; }
+
+            audioPkt->is_loop_start = 0;
+            audioPkt->is_loop_end = 0;
+
+            if(ctx->loop_seamless && pkt->pts >= ctx->audio_rebase_truncated){
+                audioPkt->is_loop_end = 1;
+                audio_done = 1;
+                //if the audio-stream is trimmed to the exact video-duration then the last frame is most probably not a complete audio-frame
+                audioPkt->last_frame_duration = (pkt->pts + pkt->duration) - ctx->audio_rebase;
+            }
+
+            if(audio_loop_pending) {
+               audioPkt->is_loop_start = 1;
+               audio_loop_pending = 0;
+            }
+
+            if (pkt->pts != AV_NOPTS_VALUE) pkt->pts += loop_pts_base_audio;
+            if (pkt->dts != AV_NOPTS_VALUE) pkt->dts += loop_pts_base_audio;
+
+            av_packet_move_ref(audioPkt->queued, pkt);
+
+            if (!queue_push(ctx->audio_queue, audioPkt)) {
+                audio_pkt_free(audioPkt);
                 break;
             }
         } else if (pkt->stream_index == ctx->subtitle_stream_idx &&
                    ctx->subtitle_queue) {
+
+            //seamless loop: skip subtitle-packets if they exceed video-duration
+            if (ctx->loop_seamless && pkt->pts >= ctx->sub_rebase) {
+               av_packet_unref(pkt);
+               continue;
+            }
+
+            //if cue starts before sub_rebase but would exceed it with its duration, cut it
+            //(gated on loop_seamless: outside seamless mode sub_rebase is unset
+            //and every cue would otherwise be given a negative duration)
+            if (ctx->loop_seamless && pkt->duration > 0 &&
+                pkt->pts + pkt->duration > ctx->sub_rebase)
+                pkt->duration = ctx->sub_rebase - pkt->pts;
+
+            if (pkt->pts != AV_NOPTS_VALUE) pkt->pts += loop_pts_base_subs;
+            if (pkt->dts != AV_NOPTS_VALUE) pkt->dts += loop_pts_base_subs;
+
             AVPacket *queued = av_packet_alloc();
             if (!queued) { av_packet_unref(pkt); continue; }
             av_packet_move_ref(queued, pkt);

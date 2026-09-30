@@ -45,6 +45,7 @@ typedef struct {
     const char *paths[MAX_FILES];
     int         path_count;
     int         loop;
+    int         loop_seamless;
     int         no_audio;
     float       vol;
     double      start_pos;
@@ -75,6 +76,7 @@ static void print_usage(void)
         "\n"
         "options:\n"
         "  --loop                  loop playlist indefinitely\n"
+        "  --loop-seamless         loop one track seamless, indefinitely\n"
         "  --shuffle               randomise playlist order\n"
         "  --recursive             recurse into subdirectories when loading files from a folder\n"
         "  --no-audio              disable audio\n"
@@ -125,6 +127,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
 
     static struct option long_opts[] = {
         { "loop",             no_argument,       NULL, 'l' },
+        { "loop-seamless",    no_argument,       NULL, 'L' },
         { "shuffle",          no_argument,       NULL, 'r' },
         { "recursive",        no_argument,       NULL, 'R' },
         { "no-audio",         no_argument,       NULL, 'n' },
@@ -149,6 +152,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
     while ((c = getopt_long(argc, argv, "", long_opts, NULL)) != -1) {
         switch (c) {
             case 'l': opt->loop              = 1;            break;
+            case 'L': opt->loop_seamless     = 1;            break;
             case 'r': opt->shuffle           = 1;            break;
             case 'R': opt->recurse           = 1;            break;
             case 'n': opt->no_audio          = 1;            break;
@@ -349,6 +353,9 @@ typedef struct {
     int              sub_embedded;
     const char      *last_sub_text;
 
+    int          loop;
+    int          loop_seamless;
+
     int64_t      wall_start;
     int          frame_count;
     int          frames_dropped;   /* late frames skipped to stay real-time */
@@ -433,6 +440,7 @@ static DecodedFrame *skip_late_frames(PlayerContext *p)
 
 static void player_threads_start(PlayerContext *p)
 {
+    p->demux.loop_seamless = p->loop_seamless;
     ThreadArg *da = malloc(sizeof(*da)); da->p = p;
     pthread_create(&p->dtid, NULL, demux_thread, da);
     if (p->audio_active && p->separate_audio) {
@@ -451,6 +459,58 @@ static void player_threads_start(PlayerContext *p)
     }
 }
 
+/*
+ * Discard everything still sitting in a packet queue, and report how many
+ * items went in the bin.
+ *
+ * queue_close() alone does not stop a consumer: queue_pop() hands back every
+ * buffered item before it reports closed, by design, so the tail of a clip
+ * still plays out at a natural end of stream. On a switch or a seek that is
+ * exactly wrong — the queues hold seconds of already-demuxed media and the
+ * consumers grind all of it through the hardware in real time before their
+ * join returns.
+ *
+ * Safe to call with the threads still running: queue_trypop() takes the queue
+ * mutex, so we just race the consumer for items and free whatever we win.
+ * Also plugs a leak — queue_destroy() never freed what was left behind.
+ */
+static int queue_drain_packets(Queue *q)
+{
+    void *item;
+    int   n = 0;
+
+    while (queue_trypop(q, &item) == 1) {
+        AVPacket *pkt = (AVPacket *)item;
+        av_packet_free(&pkt);
+        n++;
+    }
+    return n;
+}
+
+/* Same, for the audio queue: it carries AudioPkt wrappers, not bare packets. */
+static int queue_drain_audio(Queue *q)
+{
+    void *item;
+    int   n = 0;
+
+    while (queue_trypop(q, &item) == 1) {
+        audio_pkt_free((AudioPkt *)item);
+        n++;
+    }
+    return n;
+}
+
+/* Same, for decoded frames. These are requeued rather than just freed: the
+ * V4L2 CAPTURE buffer behind each one has to go back to the decoder, which
+ * outlives this call on the seek path. */
+static void queue_drain_frames(PlayerContext *p)
+{
+    void *item;
+
+    while (queue_trypop(&p->frame_queue, &item) == 1)
+        vdec_requeue_frame(&p->vdec, (DecodedFrame *)item);
+}
+
 static void player_threads_stop(PlayerContext *p)
 {
     queue_close(&p->video_queue);
@@ -458,17 +518,31 @@ static void player_threads_stop(PlayerContext *p)
     queue_close(&p->frame_queue);
     if (p->sub_active && p->sub_embedded)
         queue_close(&p->sub_queue);
+
+    /* Throw the backlog away so the consumers hit "closed and empty" on their
+     * next pop instead of playing it out. */
+    int audio_backlog = queue_drain_audio(&p->audio_queue);
+    queue_drain_packets(&p->video_queue);
+    if (p->sub_active && p->sub_embedded)
+        queue_drain_packets(&p->sub_queue);
+    queue_drain_frames(p);
+
+    /* Release the audio thread from a pause wait or a blocking write. Only
+     * drop the card when there was a backlog: with nothing left to discard
+     * this is a natural end of clip and those last samples are the real tail
+     * of the audio. */
+    if (p->audio_active)
+        audio_abort(&p->audio, audio_backlog > 0);
+
     pthread_join(p->dtid, NULL);
     if (p->audio_active && p->separate_audio)
         pthread_join(p->datid, NULL);
     pthread_join(p->vtid, NULL);
-    if (p->audio_active) {
-        audio_resume(&p->audio);
+    if (p->audio_active)
         pthread_join(p->atid, NULL);
-    }
     if (p->sub_active && p->sub_embedded)
         pthread_join(p->stid, NULL);
-    }
+}
 
 static void player_queues_reinit(PlayerContext *p)
 {
@@ -716,6 +790,7 @@ static int player_open(PlayerContext *p, const char *path,
     p->separate_audio    = 0;
     p->image_duration_us = (int64_t)(opt->image_duration_s * 1000000.0);
     p->drm_ctx           = drm;
+    p->loop_seamless     = opt->loop_seamless;
 
     if (playlist_open(&p->playlist, path, path_audio,
                       opt->loop, opt->shuffle, opt->recurse, opt->yt_quality) < 0)
@@ -840,6 +915,7 @@ static int run_ws_mode(Options *opt)
     memset(&player, 0, sizeof(player));
     player.output_idx = 0;
     player.no_audio   = opt->no_audio;
+    player.loop_seamless   = opt->loop_seamless;
 
     int paused = 0;
     int audio_started = 0;
@@ -1076,6 +1152,7 @@ static int run_control_mode(Options *opt)
     player.no_audio          = opt->no_audio;
     player.drm_ctx           = &drm;
     player.image_duration_us = (int64_t)(opt->image_duration_s * 1000000.0);
+    player.loop_seamless     = opt->loop_seamless;
 
     int  paused        = 0;
     int  audio_started = 0;
@@ -1116,6 +1193,11 @@ static int run_control_mode(Options *opt)
                 player_close_pipeline(&player);
                 paused        = 0;
                 audio_started = 0;
+                /* Seamless looping is per clip here, not per session: the
+                 * demuxer never reports EOF in seamless mode, so applying it
+                 * to a one-shot "load" would swallow the "ended" event and
+                 * leave the controller waiting forever. */
+                player.loop_seamless = loop && opt->loop_seamless;
                 parse_separated_video_audio_url(arg, current_path, current_audio);
                 if (player_open_video(&player, current_path, current_audio, opt) < 0) {
                     fprintf(stderr, "zeroplay: failed to open '%s'\n", current_path);
@@ -1123,6 +1205,7 @@ static int run_control_mode(Options *opt)
                     current_loop    = 0;
                 } else {
                     if (player.audio_active) audio_pause(&player.audio);
+
                     player_threads_start(&player);
                     current_loop = loop;
                     fprintf(stderr, "zeroplay: %s %s\n",
@@ -1536,7 +1619,14 @@ int main(int argc, char *argv[])
             /* Drain and display any remaining decoded frames before exiting */
             for (int i = 0; i < opened; i++) {
                 PlayerContext *p = &players[i];
-                if (p->image_mode) continue;
+                /* A player that hit eos via a failed player_advance_to_next()
+                 * (skip key, or no next playlist item) already ran
+                 * player_close_pipeline() — its frame_queue was destroyed and
+                 * any frames still in it reference dmabuf fds vdec_close()
+                 * already closed. Only a player that hit eos via its queue
+                 * reporting closed+empty (natural end of decode, pipeline
+                 * still open) has real frames left to drain here. */
+                if (p->image_mode || !p->pipeline_open) continue;
                 while (1) {
                     if (p->held_frame) {
                         int64_t due = p->wall_start + p->held_frame->pts_us;
