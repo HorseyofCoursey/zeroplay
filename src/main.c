@@ -1255,6 +1255,7 @@ static int run_control_mode(Options *opt)
                 current_loop    = 0;
                 current_path[0] = '\0';
                 paused          = 0;
+                play_image      = 0;
             } else if (strcmp(cmd, "quit") == 0) {
                 g_signal_quit = 1;
             }
