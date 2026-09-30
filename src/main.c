@@ -96,7 +96,7 @@ static void print_usage(void)
         "  --control               read newline commands on stdin, hold the display\n"
         "                          across clips (no console flash between videos).\n"
         "                          commands: load <path> | loadloop <path> | pause |\n"
-        "                          resume | stop | quit. emits 'ended' on stdout when\n"
+        "                          resume | seek | stop | quit. emits 'ended' on stdout when\n"
         "                          a non-looping clip finishes. an optional initial\n"
         "                          path is auto-looped at startup.\n"
         "\n"
