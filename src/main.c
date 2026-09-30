@@ -1231,12 +1231,17 @@ static int run_control_mode(Options *opt)
                 paused          = 0;
             }else if (strcmp(cmd, "seek") == 0) {
 
+                if (!arg || !*arg) {
+                    fprintf(stderr, "zeroplay: seek requires a position in ms\n");
+                    continue;
+                }
+
                 char *end;
                 long long value = strtoll(arg, &end, 10);
 
                 if (end == arg || *end != '\0') {
                     fprintf(stderr, "zeroplay: %s is not a valid seek value\n",arg);
-                    break;
+                    continue;
                 }
 
                 if (player.pipeline_open) {
