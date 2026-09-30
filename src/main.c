@@ -1265,8 +1265,16 @@ static int run_control_mode(Options *opt)
         if (play_image) {
             if (player.image_end_us == 0)
                 continue;
-            if (player.image_end_us > 0 && now_us() < player.image_end_us)
+            if (now_us() < player.image_end_us)
                 continue;
+
+            /* Fixed-duration image finished (loadloop images have
+             * image_end_us == 0 and never reach here). */
+            player.image_mode = 0;
+            play_image = 0;
+            printf("ended\n");
+            fflush(stdout);
+            continue;
         }
 
         if (!player.pipeline_open && !play_image) { sleep_us(50000); continue; }
