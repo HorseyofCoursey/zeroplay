@@ -851,9 +851,13 @@ static void player_go_to_prev(PlayerContext *p, DrmContext *drm,
     if (!item) return;
 
     if (item->type == ITEM_IMAGE) {
-        show_image(p, item->path, drm, p->image_duration_us);
-        fprintf(stderr, "zeroplay[%d]: showing '%s'\n",
-                p->output_idx, basename(item->path));
+        if (show_image(p, item->path, drm, p->image_duration_us) == 0) {
+            fprintf(stderr, "zeroplay[%d]: showing '%s'\n",
+                    p->output_idx, basename(item->path));
+        } else {
+            fprintf(stderr, "zeroplay[%d]: failed to decode image '%s'\n",
+                    p->output_idx, item->path);
+        }
     } else {
         if (player_open_video(p, item->path, item->path_audio, opt) == 0)
             player_threads_start(p);
