@@ -96,7 +96,7 @@ static void print_usage(void)
         "  --control               read newline commands on stdin, hold the display\n"
         "                          across clips (no console flash between videos).\n"
         "                          commands: load <path> | loadloop <path> | pause |\n"
-        "                          resume | stop | quit. emits 'ended' on stdout when\n"
+        "                          resume | seek | stop | quit. emits 'ended' on stdout when\n"
         "                          a non-looping clip finishes. an optional initial\n"
         "                          path is auto-looped at startup.\n"
         "\n"
@@ -1229,6 +1229,36 @@ static int run_control_mode(Options *opt)
                 current_loop    = 0;
                 current_path[0] = '\0';
                 paused          = 0;
+            }else if (strcmp(cmd, "seek") == 0) {
+
+                if (!arg || !*arg) {
+                    fprintf(stderr, "zeroplay: seek requires a position in ms\n");
+                    continue;
+                }
+
+                char *end;
+                long long value = strtoll(arg, &end, 10);
+
+                if (end == arg || *end != '\0') {
+                    fprintf(stderr, "zeroplay: %s is not a valid seek value\n",arg);
+                    continue;
+                }
+
+                if (player.pipeline_open) {
+                    int64_t target_us = value * 1000LL;
+                    if (target_us < 0) target_us = 0;
+                    if (player.duration_us > 0 && target_us > player.duration_us)
+                        target_us = player.duration_us;
+                    int was_paused = paused;
+                    paused = 0;
+                    player_seek(&player, target_us);
+                    player.current_pts = target_us;
+                    if (was_paused) {
+                        paused = 1;
+                        if (player.audio_active)
+                            audio_pause(&player.audio);
+                    }
+                }
             } else if (strcmp(cmd, "quit") == 0) {
                 g_signal_quit = 1;
             }
