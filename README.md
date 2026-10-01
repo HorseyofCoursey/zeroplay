@@ -356,7 +356,7 @@ If an initial path is given it auto-loops at startup so the screen is live immed
 | Event | Description |
 |---|---|
 | `ready` | Emitted at startup when display is initialised |
-| `ended` | Emitted when a non-looping clip finishes |
+| `ended` | Emitted when a non-looping clip or image finishes |
 
 Useful for Python scripts, kiosk controllers, or any local process that needs seamless clip switching without WebSocket overhead.
 

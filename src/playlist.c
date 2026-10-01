@@ -15,7 +15,7 @@
 /* File type detection                                                  */
 /* ------------------------------------------------------------------ */
 
-static PlaylistItemType type_from_ext(const char *path)
+PlaylistItemType type_from_ext(const char *path)
 {
     const char *dot = strrchr(path, '.');
     if (!dot) return ITEM_UNKNOWN;

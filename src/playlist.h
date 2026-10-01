@@ -42,6 +42,8 @@ int           playlist_open(Playlist *pl, const char *path, const char *path_aud
                              int loop, int shuffle, int recurse, int yt_quality);
 void          playlist_close(Playlist *pl);
 
+PlaylistItemType type_from_ext(const char *path);
+
 /* Returns pointer to current item, or NULL if empty. */
 PlaylistItem *playlist_current(Playlist *pl);
 
