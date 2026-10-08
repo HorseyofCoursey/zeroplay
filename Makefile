@@ -2,7 +2,7 @@ CC      = gcc
 # Large File Support: off_t is 32-bit on 32-bit targets (Pi Zero/Zero 2 W)
 # without this, so stat() on a file over 2 GiB fails with EOVERFLOW.
 CFLAGS  = -D_FILE_OFFSET_BITS=64
-CFLAGS += -Wall -Wextra -O2
+CFLAGS += -Wall -Wextra -O2 -g -fno-omit-frame-pointer
 CFLAGS += $(shell pkg-config --cflags libavformat libavcodec libavutil libswresample libswscale libdrm 2>/dev/null)
 CFLAGS += -I/usr/include/libdrm
 

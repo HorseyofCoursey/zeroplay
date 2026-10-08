@@ -1,3 +1,5 @@
+#include <errno.h>
+#include <sys/ioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,8 +32,8 @@ int g_verbose = 0;
 #define KEY_UP      1002
 #define KEY_DOWN    1003
 
-#define SEEK_SHORT_US   (60LL  * 1000000LL)
-#define SEEK_LONG_US    (300LL * 1000000LL)
+#define SEEK_SHORT_US   (10LL  * 1000000LL)
+#define SEEK_LONG_US    (150LL * 1000000LL)
 
 /* If drm_present() is slower than one frame interval — an SPI/DBI panel
  * flushes the whole framebuffer over a serial bus — the render loop falls
@@ -107,8 +109,8 @@ static void print_usage(void)
         "\n"
         "controls:\n"
         "  p / space               pause / resume\n"
-        "  left / right            seek -/+ 1 minute\n"
-        "  up / down               seek -/+ 5 minutes\n"
+        "  left / right            seek -/+ 10 seconds\n"
+        "  up / down               seek -/+ 2.5 minutes\n"
         "  + / -                   volume up / down\n"
         "  m                       mute / unmute\n"
         "  i / o                   previous / next chapter\n"
@@ -253,32 +255,54 @@ static void term_restore(void)
 
 static void term_raw(void)
 {
-    tcgetattr(STDIN_FILENO, &orig_termios);
-    atexit(term_restore);
-    struct termios raw = orig_termios;
-    raw.c_lflag &= (unsigned int)~(ECHO | ICANON);
-    raw.c_cc[VMIN]  = 0;
-    raw.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
-    write(STDOUT_FILENO, "\033[?25l", 6);
+    tcgetattr(STDIN_FILENO, &orig_termios);        // save terminal settings
+    atexit(term_restore);                          // register terminal fn to restore terminal at exit
+    struct termios raw = orig_termios;             // copy current settings as starting point
+    raw.c_lflag &= (unsigned int)~(ECHO | ICANON); // disable character printing + enable input per keypress w/o enter
+    raw.c_cc[VMIN]  = 0;                           // no min bytes on stdin buffer before read() (non-blocking)
+    raw.c_cc[VTIME] = 0;                           // no timeout for read()
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);      // apply new settings, discard any unread input
+    write(STDOUT_FILENO, "\033[?25l", 6);          // hide terminal cursor
 }
 
-static int key_poll(void)
-{
+static int key_poll(void) {
     unsigned char c;
-    if (read(STDIN_FILENO, &c, 1) != 1) return 0;
-    if (c != 27) return (int)c;
-    unsigned char seq[2] = {0, 0};
-    if (read(STDIN_FILENO, &seq[0], 1) != 1) return 27;
-    if (seq[0] != '[') return 27;
-    if (read(STDIN_FILENO, &seq[1], 1) != 1) return 27;
+    ssize_t n = read(STDIN_FILENO, &c, 1);
+    // Claude said this was wrong; -1 might not mean err but no input? But I think it depends on blocking/non-blocking
+    if (n < 0) {  
+        fprintf(stderr, "ERROR: key_poll() Failed to read STDIN. (1st read)\n");
+        return -1;
+    }
+    else if (n == 0) { return 0; }   // no keypress
+    if (c != 27) { return (int)c; }  // plain key
+
+    unsigned int pending = 0;
+    n = ioctl(STDIN_FILENO, FIONREAD, &pending);
+    if (n < 0) {
+        fprintf(stderr, "ERROR: key_poll() Failed on ioctl().\n");
+        return -1;
+    }
+    if (pending == 0) { return 27; }  // ESC keypress
+
+    // multi-byte
+    unsigned char seq[8] = {0};
+    if (pending > (int)(sizeof(seq) - 1)) { pending = sizeof(seq) - 1; }
+    
+    n = read(STDIN_FILENO, seq, pending);
+    if (n < 0) {
+        fprintf(stderr, "ERROR: key_poll() Failed to read STDIN. (2nd read)\n");
+        return -1;
+    }
+
+    // check seq for arrow keys
+    if (seq[0] != '[') { return 0; }
     switch (seq[1]) {
         case 'A': return KEY_UP;
         case 'B': return KEY_DOWN;
         case 'C': return KEY_RIGHT;
         case 'D': return KEY_LEFT;
     }
-    return 27;
+    return 0;  // others for e.g. funciton keys
 }
 
 static int64_t now_us(void)
@@ -319,7 +343,7 @@ static void crash_handler(int sig)
 /* ------------------------------------------------------------------ */
 
 static int find_srt_alongside(const char *video_path,
-                               char *out, int out_size)
+                              char *out, int out_size)
 {
     strncpy(out, video_path, (size_t)(out_size - 5));
     out[out_size - 5] = '\0';
@@ -342,13 +366,15 @@ typedef struct {
     Queue        video_queue;
     Queue        audio_queue;
     Queue        frame_queue;
+
+    // threads: demux-thread, demux-audio-thread, video-decode-thread, audio-thread
     pthread_t    dtid, datid, vtid, atid;
     int          pipeline_open;
     int          audio_active;
 
     SubtitleContext  sub;
     Queue            sub_queue;
-    pthread_t        stid;
+    pthread_t        stid;            // subtitle thread
     int              sub_active;
     int              sub_embedded;
     const char      *last_sub_text;
@@ -377,6 +403,24 @@ typedef struct {
 
 typedef struct { PlayerContext *p; } ThreadArg;
 
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_t       tid;
+    int             key;
+    volatile sig_atomic_t running;
+} InputContext;
+
+static InputContext g_input;
+
+// helper function to point queue_flush_with_free() to
+static void free_pkt_item(void *item)
+{
+    AVPacket *pkt = item;
+    av_packet_free(&pkt);
+}
+
+// need another helper function to properly drain vdec frame items
+
 static void *demux_thread(void *arg)
 {
     PlayerContext *p = ((ThreadArg *)arg)->p; free(arg);
@@ -401,6 +445,21 @@ static void *subtitle_thread(void *arg)
 {
     PlayerContext *p = ((ThreadArg *)arg)->p; free(arg);
     subtitle_run(&p->sub); return NULL;
+}
+
+static void *input_thread(void *arg) 
+{
+    InputContext *ic = (InputContext *)arg;
+    while (ic->running) {
+        int k = key_poll();
+        if (k != 0) {
+            pthread_mutex_lock(&ic->mutex);
+            ic->key = k;
+            pthread_mutex_unlock(&ic->mutex);
+        }
+        sleep_us(50000);  // 20x per sec
+    }
+    return NULL;
 }
 
 /*
@@ -440,8 +499,12 @@ static DecodedFrame *skip_late_frames(PlayerContext *p)
 
 static void player_threads_start(PlayerContext *p)
 {
+    // Start threads in following order:
+    // demux, demux-audio, video-decode, audio, subtitle
+
     p->demux.loop_seamless = p->loop_seamless;
     ThreadArg *da = malloc(sizeof(*da)); da->p = p;
+
     pthread_create(&p->dtid, NULL, demux_thread, da);
     if (p->audio_active && p->separate_audio) {
         ThreadArg *daa = malloc(sizeof(*daa)); daa->p = p;
@@ -513,35 +576,41 @@ static void queue_drain_frames(PlayerContext *p)
 
 static void player_threads_stop(PlayerContext *p)
 {
+    // Added queue_flush() calls. This allowed audio pthread_join() not to hang for several secs
+
     queue_close(&p->video_queue);
+    queue_flush_with_free(&p->video_queue, free_pkt_item);
+
     queue_close(&p->audio_queue);
+    // SEGFAULT used to happen here when I used queue_flush_with_free()
+    // content of audio_queue was changed upstream from queue of av_packets to wrapper struct around av_packets I believe.
+    // however I'm pretty sure this workaround causes a memory leak
+    queue_flush(&p->audio_queue);
+
     queue_close(&p->frame_queue);
-    if (p->sub_active && p->sub_embedded)
+    // this should probs be different bc it needs to return hardware resource mem
+    // likely memory leak here
+    queue_flush(&p->frame_queue);
+
+    if (p->sub_active && p->sub_embedded) {
         queue_close(&p->sub_queue);
+        queue_flush_with_free(&p->sub_queue, free_pkt_item);
+    }
 
-    /* Throw the backlog away so the consumers hit "closed and empty" on their
-     * next pop instead of playing it out. */
-    int audio_backlog = queue_drain_audio(&p->audio_queue);
-    queue_drain_packets(&p->video_queue);
-    if (p->sub_active && p->sub_embedded)
-        queue_drain_packets(&p->sub_queue);
-    queue_drain_frames(p);
-
-    /* Release the audio thread from a pause wait or a blocking write. Only
-     * drop the card when there was a backlog: with nothing left to discard
-     * this is a natural end of clip and those last samples are the real tail
-     * of the audio. */
-    if (p->audio_active)
-        audio_abort(&p->audio, audio_backlog > 0);
 
     pthread_join(p->dtid, NULL);
-    if (p->audio_active && p->separate_audio)
+    if (p->audio_active && p->separate_audio) {
         pthread_join(p->datid, NULL);
+    }
     pthread_join(p->vtid, NULL);
-    if (p->audio_active)
+    if (p->audio_active) { 
+        audio_resume(&p->audio);  // not too sure why I have this tbh.
+        // line used to cause ~5.5s hang in quit+seek 256*21.3ms=5.4528s (default QUEUE_SIZE * AAC frame length)
         pthread_join(p->atid, NULL);
-    if (p->sub_active && p->sub_embedded)
+    }
+    if (p->sub_active && p->sub_embedded) {
         pthread_join(p->stid, NULL);
+    }
 }
 
 static void player_queues_reinit(PlayerContext *p)
@@ -571,7 +640,6 @@ static void player_close_pipeline(PlayerContext *p)
     if (p->prev_frame) {
         vdec_requeue_frame(&p->vdec, p->prev_frame); p->prev_frame = NULL;
     }
-
     player_threads_stop(p);
     if (p->audio_active) audio_close(&p->audio);
     if (p->sub_active) {
@@ -624,8 +692,7 @@ static int player_open_video(PlayerContext *p, const char *filename,
     if (p->no_audio)
         p->demux.audio_stream_idx = -1;
 
-    AVStream *video_stream =
-        p->demux.fmt_ctx->streams[p->demux.video_stream_idx];
+    AVStream *video_stream = p->demux.fmt_ctx->streams[p->demux.video_stream_idx];
 
     if (vdec_open(&p->vdec, video_stream, &p->video_queue, &p->frame_queue) < 0)
         return -1;
@@ -641,9 +708,9 @@ static int player_open_video(PlayerContext *p, const char *filename,
                 p->demux.fmt_ctx->streams[p->demux.audio_stream_idx];
         }
 
-        if (audio_stream && (audio_open(&p->audio, audio_stream,
-                                         opt->audio_device,
-                                         &p->audio_queue) == 0)) {
+        if ( audio_stream && 
+             (audio_open(&p->audio, audio_stream, opt->audio_device, &p->audio_queue) == 0) )
+        {
             p->audio.volume = opt->vol / 100.0f;
             p->audio_active = 1;
 
@@ -669,9 +736,9 @@ static int player_open_video(PlayerContext *p, const char *filename,
     if (opt->start_pos > 0.0) {
         int64_t start_us = (int64_t)(opt->start_pos * 1000000.0);
         if (start_us > p->duration_us) start_us = p->duration_us;
-        demux_seek(&p->demux, start_us);
+        demux_seek(&p->demux, start_us, 1);
         if (p->audio_active && p->separate_audio)
-            demux_seek(&p->demux_audio, start_us);
+            demux_seek(&p->demux_audio, start_us, 1);
         p->current_pts = start_us;
     }
 
@@ -709,19 +776,19 @@ static int player_open_video(PlayerContext *p, const char *filename,
     return 0;
 }
 
-static void player_seek(PlayerContext *p, int64_t target_us)
+static void player_seek(PlayerContext *p, int64_t target_us, unsigned int backward)
 {
     if (!p->pipeline_open) return;
     fprintf(stderr, "zeroplay[%d]: seeking to %.1fs...\n",
             p->output_idx, target_us / 1e6);
 
     if (p->held_frame) { vdec_requeue_frame(&p->vdec, p->held_frame); p->held_frame = NULL; }
-    if (p->prev_frame) { vdec_requeue_frame(&p->vdec, p->prev_frame); p->prev_frame  = NULL; }
-
+    if (p->prev_frame) { vdec_requeue_frame(&p->vdec, p->prev_frame); p->prev_frame = NULL; }
+    
     player_threads_stop(p);
-    demux_seek(&p->demux, target_us);
+    demux_seek(&p->demux, target_us, backward);
     if (p->audio_active && p->separate_audio)
-        demux_seek(&p->demux_audio, target_us);
+        demux_seek(&p->demux_audio, target_us, backward);
     vdec_flush(&p->vdec);
     if (p->audio_active) audio_flush(&p->audio);
     if (p->sub_active)   subtitle_flush(&p->sub);
@@ -753,7 +820,7 @@ static int show_image(PlayerContext *p, const char *path, DrmContext *drm, int64
 }
 
 static int player_advance_to_next(PlayerContext *p, DrmContext *drm,
-                                   const Options *opt)
+                                  const Options *opt)
 {
     if (playlist_advance(&p->playlist) < 0)
         return -1;
@@ -792,8 +859,8 @@ static int player_advance_to_next(PlayerContext *p, DrmContext *drm,
 }
 
 static int player_open(PlayerContext *p, const char *path,
-                        const char *path_audio,
-                        const Options *opt, int output_idx, DrmContext *drm)
+                       const char *path_audio,
+                       const Options *opt, int output_idx, DrmContext *drm)
 {
     memset(p, 0, sizeof(*p));
     p->output_idx        = output_idx;
@@ -833,14 +900,13 @@ static int player_open(PlayerContext *p, const char *path,
     return 0;
 }
 
-static void player_shutdown(PlayerContext *p)
-{
+static void player_shutdown(PlayerContext *p) {
     player_close_pipeline(p);
     playlist_close(&p->playlist);
 }
 
 static void player_go_to_prev(PlayerContext *p, DrmContext *drm,
-                               const Options *opt)
+                              const Options *opt)
 {
     player_close_pipeline(p);
     p->image_mode = 0;
@@ -989,7 +1055,7 @@ static int run_ws_mode(Options *opt)
                         target_us = player.duration_us;
                     int was_paused = paused;
                     paused = 0;
-                    player_seek(&player, target_us);
+                    player_seek(&player, target_us, 1);  // backwards/forwards not implemented in ws mode bc I don't use it.
                     player.current_pts = target_us;
                     ws_shared_state_set_position(&shared, target_us / 1e6);
                     if (was_paused) {
@@ -1006,7 +1072,7 @@ static int run_ws_mode(Options *opt)
         }
 
         if (!player.pipeline_open) { sleep_us(50000); continue; }
-        if (paused)                 { sleep_us(10000); continue; }
+        if (paused)                { sleep_us(10000); continue; }
 
         PlayerContext *p = &player;
 
@@ -1015,10 +1081,10 @@ static int run_ws_mode(Options *opt)
             int rc = queue_trypop(&p->frame_queue, &item);
             if (rc == 0) { sleep_us(2000); continue; }
             if (rc < 0) {
-		if (p->prev_frame) {
-        	    vdec_requeue_frame(&p->vdec, p->prev_frame);
+                if (p->prev_frame) {
+                    vdec_requeue_frame(&p->vdec, p->prev_frame);
                     p->prev_frame = NULL;
-    		}
+                }
                 fprintf(stderr, "zeroplay: end of stream\n");
                 player_close_pipeline(p);
                 ws_shared_state_set_idle(&shared, 1);
@@ -1404,7 +1470,11 @@ int main(int argc, char *argv[])
     if (parse_args(argc, argv, &opt) < 0)
         return 1;
 
-    avformat_network_init();
+    // ffmpeg fn to work around thread-safety issues in OpenSSL or GnuTLS
+    if(avformat_network_init() < 0) {
+        fprintf(stderr, "zeroplay: ERROR: avformat_network_init() failed.\n");
+        return -1;
+    }
 
 #ifdef HAVE_WEBSOCKET
     if (opt.ws_url && opt.ws_url[0]) {
@@ -1425,8 +1495,10 @@ int main(int argc, char *argv[])
     }
 
     DrmContext drm;
-    if (drm_open(&drm) < 0)
+    if (drm_open(&drm) < 0) {
+        fprintf(stderr, "zeroplay: ERROR: drm_open() failed.\n");
         return 1;
+    }
 
     int player_count = opt.path_count;
     if (player_count > drm.output_count) {
@@ -1453,14 +1525,24 @@ int main(int argc, char *argv[])
         opened++;
     }
 
-    term_raw();
+    term_raw();  // change terminal state
+    // intercept control-C signal to handle all threads cleanly
     signal(SIGINT,  signal_handler);
-    signal(SIGTERM, signal_handler);
 
-    for (int i = 0; i < opened; i++)
-        if (!players[i].image_mode && players[i].pipeline_open)
+    // input thread should be started first
+    pthread_mutex_init(&g_input.mutex, NULL);
+    g_input.key = 0;
+    g_input.running = 1;
+    pthread_create(&g_input.tid, NULL, input_thread, &g_input);
+
+    // start other threads
+    for (int i = 0; i < opened; i++) {
+        if (!players[i].image_mode && players[i].pipeline_open) {
             player_threads_start(&players[i]);
-
+        }
+    }
+    
+    // alter priority of main thread
     {
         struct sched_param sp = { .sched_priority = 10 };
         pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
@@ -1472,53 +1554,58 @@ int main(int argc, char *argv[])
     while (!quit) {
         if (g_signal_quit) { quit = 1; break; }
 
-        int key = key_poll();
+        // key_poll() was moved to another thread.
+        pthread_mutex_lock(&g_input.mutex);
+        int key = g_input.key;
+        g_input.key = 0;
+        pthread_mutex_unlock(&g_input.mutex);
 
-        if (key == 'q' || key == 'Q' || key == 27) { quit = 1; break; }
-
-        if (key == 'p' || key == 'P' || key == ' ') {
+        // key handling block
+        if (key == -1 || key == 'q' || key == 'Q' || key == 27) {
+            quit = 1; break;
+        }
+        else if (key == 'p' || key == 'P' || key == ' ') {
             paused = !paused;
             for (int i = 0; i < opened; i++) {
-                if (players[i].image_mode) continue;
+                if (players[i].image_mode) { continue; }
                 if (paused) {
                     if (players[i].audio_active) audio_pause(&players[i].audio);
                 } else {
-                    if (players[i].held_frame)
-                        players[i].wall_start =
-                            now_us() - players[i].held_frame->pts_us;
+                    players[i].wall_start = now_us() - players[i].current_pts;
                     if (players[i].audio_active) audio_resume(&players[i].audio);
                 }
             }
             fprintf(stderr, "zeroplay: %s\n", paused ? "paused" : "playing");
         }
-
-        if (key == '+' || key == '=') {
-            for (int i = 0; i < opened; i++)
+        else if (key == '+' || key == '=') {
+            for (int i = 0; i < opened; i++) {
                 if (players[i].audio_active) {
                     float v = audio_volume_up(&players[i].audio);
                     if (i == 0)
                         fprintf(stderr, "zeroplay: volume %.0f%%\n", v * 100.0f);
                 }
+            }
         }
-        if (key == '-' || key == '_') {
-            for (int i = 0; i < opened; i++)
+        else if (key == '-' || key == '_') {
+            for (int i = 0; i < opened; i++) {
                 if (players[i].audio_active) {
                     float v = audio_volume_down(&players[i].audio);
                     if (i == 0)
                         fprintf(stderr, "zeroplay: volume %.0f%%\n", v * 100.0f);
                 }
+            }
         }
-        if (key == 'm' || key == 'M') {
-            for (int i = 0; i < opened; i++)
+        else if (key == 'm' || key == 'M') {
+            for (int i = 0; i < opened; i++) {
                 if (players[i].audio_active) {
                     int muted = audio_toggle_mute(&players[i].audio);
                     if (i == 0)
                         fprintf(stderr, "zeroplay: %s\n",
                                 muted ? "muted" : "unmuted");
                 }
+            }
         }
-
-        if (key == 'n' || key == 'N') {
+        else if (key == 'n' || key == 'N') {
             for (int i = 0; i < opened; i++) {
                 player_close_pipeline(&players[i]);
                 players[i].image_mode = 0;
@@ -1527,14 +1614,13 @@ int main(int argc, char *argv[])
             }
             fprintf(stderr, "zeroplay: skip\n");
         }
-
-        if (key == 'b' || key == 'B') {
-            for (int i = 0; i < opened; i++)
+        else if (key == 'b' || key == 'B') {
+            for (int i = 0; i < opened; i++) {
                 player_go_to_prev(&players[i], &drm, &opt);
+            }
             fprintf(stderr, "zeroplay: previous\n");
         }
-
-        if (key == 'o' || key == 'O' || key == 'i' || key == 'I') {
+        else if (key == 'o' || key == 'O' || key == 'i' || key == 'I') {
             for (int i = 0; i < opened; i++) {
                 if (players[i].image_mode || !players[i].pipeline_open) continue;
                 int64_t target = 0;
@@ -1546,9 +1632,10 @@ int main(int argc, char *argv[])
                 if (found == 0) {
                     int was_paused = paused;
                     paused = 0;
-                    if (was_paused)
+                    if (was_paused) {
                         audio_resume(&players[i].audio);
-                    player_seek(&players[i], target);
+                    }
+                    player_seek(&players[i], target, 1);
                     players[i].current_pts = target;
                     if (was_paused) {
                         paused = 1;
@@ -1558,47 +1645,53 @@ int main(int argc, char *argv[])
                 }
             }
         }
-
-        if (key == KEY_RIGHT || key == KEY_LEFT ||
-            key == KEY_UP    || key == KEY_DOWN) {
+        else if (key == KEY_RIGHT || key == KEY_LEFT || key == KEY_UP || key == KEY_DOWN) {
             int64_t delta = 0;
-            if      (key == KEY_RIGHT) delta = +SEEK_SHORT_US;
-            else if (key == KEY_LEFT)  delta = -SEEK_SHORT_US;
-            else if (key == KEY_UP)    delta = +SEEK_LONG_US;
-            else if (key == KEY_DOWN)  delta = -SEEK_LONG_US;
+            unsigned int backward = 0;  // seek direction flag
+            if      (key == KEY_RIGHT) { delta = +SEEK_SHORT_US; }
+            else if (key == KEY_LEFT)  { delta = -SEEK_SHORT_US; backward = 1; }
+            else if (key == KEY_UP)    { delta = +SEEK_LONG_US; }
+            else if (key == KEY_DOWN)  { delta = -SEEK_LONG_US; backward = 1;}
 
             int was_paused = paused;
             paused = 0;
-            if (was_paused)
+            if (was_paused) {
                 for (int i = 0; i < opened; i++)
                     audio_resume(&players[i].audio);
+            }
             for (int i = 0; i < opened; i++) {
                 if (players[i].image_mode || !players[i].pipeline_open) continue;
                 int64_t target = players[i].current_pts + delta;
                 if (target < 0) target = 0;
-                if (players[i].duration_us > 0 &&
-                    target > players[i].duration_us)
+                if (players[i].duration_us > 0 && target > players[i].duration_us) {
+                    // prevents seeking past eof - also means it won't trigger next playlist item
+                    backward = 1;
                     target = players[i].duration_us;
-                player_seek(&players[i], target);
+                }
+                player_seek(&players[i], target, backward);
                 players[i].current_pts = target;
             }
             if (was_paused) {
                 paused = 1;
-                for (int i = 0; i < opened; i++)
+                for (int i = 0; i < opened; i++) {
                     if (players[i].audio_active) audio_pause(&players[i].audio);
+                }
             }
         }
+        key = 0;  // key used, so reset it
 
-        if (paused) { sleep_us(10000); continue; }
+        if (paused) { sleep_us(50000); continue; }
 
-        int64_t next_due = INT64_MAX;
+        int64_t next_due = INT64_MAX;  // functions more as a flag I believe
         int     all_eos  = 1;
 
+        // always 1 player in my setup
         for (int i = 0; i < opened; i++) {
             PlayerContext *p = &players[i];
             if (p->eos) continue;
             all_eos = 0;
 
+            // slideshow block
             if (p->image_mode) {
                 if (p->image_end_us > 0 && now_us() >= p->image_end_us) {
                     if (player_advance_to_next(p, &drm, &opt) < 0)
@@ -1614,24 +1707,30 @@ int main(int argc, char *argv[])
                 continue;
             }
 
+            // get the next frame
             if (!p->held_frame) {
-                void *item = NULL;
+                void *item = NULL;  // to hold next frame from frame_queue
+                // rc: 1=got item, 0=empty, -1=closed+empty
                 int rc = queue_trypop(&p->frame_queue, &item);
                 if (rc == 0) {
+                    // frame not ready yet
                     next_due = 0;
                     continue;
                 }
-                if (rc < 0) {
-   		     if (p->prev_frame) {
-        		vdec_requeue_frame(&p->vdec, p->prev_frame);
-        		p->prev_frame = NULL;
-		 }
-		 if (player_advance_to_next(p, &drm, &opt) < 0)
+                else if (rc < 0) {
+                    // queue_closed
+                    if (p->prev_frame) {
+                        vdec_requeue_frame(&p->vdec, p->prev_frame);
+                        p->prev_frame = NULL;
+                    }
+                    if (player_advance_to_next(p, &drm, &opt) < 0) {
                         p->eos = 1;
-                    else
+                    } else {
                         next_due = 0;
+                    }
                     continue;
                 }
+                // advance to next frame
                 p->held_frame = (DecodedFrame *)item;
                 p->frame_count++;
             }
@@ -1645,6 +1744,7 @@ int main(int argc, char *argv[])
 
             p->current_pts = frame->pts_us;
 
+            // subtitle block
             if (p->sub_active) {
                 const char *sub = subtitle_get_active(&p->sub, p->current_pts);
                 if (sub != p->last_sub_text) {
@@ -1652,21 +1752,30 @@ int main(int argc, char *argv[])
                     p->last_sub_text = sub;
                 }
             }
+            
+            // initialize wall_start on first frame or after unpause
+            if (p->frame_count == 1 || p->wall_start == 0)
+                p->wall_start = now_us() - frame->pts_us;
 
             int64_t due = p->wall_start + frame->pts_us;
             int64_t now = now_us();
 
+            // update frame on screen if pts is reached
             if (due <= now) {
-                drm_present(&drm, p->output_idx, frame);
-                p->held_frame = NULL;
+                drm_present(&drm, p->output_idx, frame);  // ~30% of CPU time (expected)
+                p->held_frame = NULL;  // held_frame has been used, so reset.
+                next_due = 0;  // added this to prevent else statement in sleep block firing.
                 if (p->prev_frame)
                     vdec_requeue_frame(&p->vdec, p->prev_frame);
                 p->prev_frame = frame;
             } else {
+                // ensure next_due is not larger than due.
+                // next_due could otherwise be INT64_MAX if frame is held but pts hasn't passed
                 if (due < next_due) next_due = due;
             }
         }
 
+        // handle end of stream
         if (all_eos) {
             /* Drain and display any remaining decoded frames before exiting */
             for (int i = 0; i < opened; i++) {
@@ -1699,17 +1808,27 @@ int main(int argc, char *argv[])
             break;
         }
 
+        // sleep for appropriate time.
         if (next_due != INT64_MAX) {
             int64_t sl = next_due - now_us();
-            if (sl > 2000) sl = 2000;
-            if (sl > 0)    sleep_us(sl);
+            if (sl > 0) { sleep_us(sl); }
+            // else we just want to spin around for the next frame immediately.
+            // would fire if decoder is too slow I belive.
         } else {
+            // next_due is set to 0 after drm_present(), so this shouldn't fire.
             sleep_us(2000);
         }
     }
-
-    for (int i = 0; i < opened; i++) player_shutdown(&players[i]);
+    
+    for (int i = 0; i < opened; i++) {
+        fprintf(stderr, "Shutting down player %d\n", i);
+        player_shutdown(&players[i]);  // &players[i] is PlayerContext ptr
+    }
     drm_close(&drm);
+    
+    g_input.running = 0;
+    pthread_join(g_input.tid, NULL);
+    pthread_mutex_destroy(&g_input.mutex);
 
     fprintf(stderr, "have a nice day ;)\n");
     return 0;

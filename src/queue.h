@@ -25,6 +25,7 @@ int  queue_pop(Queue *q, void **item);   /* returns 0 if closed and empty */
 int  queue_trypop(Queue *q, void **item); /* non-blocking: 1=got item, 0=empty, -1=closed+empty */
 void queue_close(Queue *q);              /* unblocks all waiting threads */
 void queue_flush(Queue *q);             /* discard all items */
+void queue_flush_with_free(Queue *q, void (*free_fn)(void *));
 void queue_destroy(Queue *q);
 
 #endif

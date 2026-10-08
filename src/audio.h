@@ -29,7 +29,8 @@ typedef struct {
     /* Stream info */
     int              sample_rate;    /* codec sample rate (input to swr) */
     int              alsa_rate;     /* actual ALSA hardware rate (output of swr) */
-    int              channels;
+    unsigned int     src_channels;
+    unsigned int     dev_channels;
     AVRational       time_base;
 
     /* Queue */

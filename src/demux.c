@@ -477,7 +477,7 @@ done:
 
 /* ------------------------------------------------------------------ */
 
-int demux_seek(DemuxContext *ctx, int64_t target_us)
+int demux_seek(DemuxContext *ctx, int64_t target_us, unsigned int backward)
 {
     /* Clamp to valid range */
     if (target_us < 0) target_us = 0;
@@ -485,8 +485,8 @@ int demux_seek(DemuxContext *ctx, int64_t target_us)
         target_us = ctx->duration_us;
 
     /* av_seek_frame uses AV_TIME_BASE (microseconds) when stream_index=-1 */
-    int ret = av_seek_frame(ctx->fmt_ctx, -1, target_us,
-                            target_us < 0 ? 0 : AVSEEK_FLAG_BACKWARD);
+    // AVSEEK_FLAG_BACKWARD causes max_ts to be set to target_us. 
+    int ret = av_seek_frame(ctx->fmt_ctx, -1, target_us, (backward > 0) ? AVSEEK_FLAG_BACKWARD : 0);
     if (ret < 0) {
         fprintf(stderr, "demux: seek failed\n");
         return -1;
