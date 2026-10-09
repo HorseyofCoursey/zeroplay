@@ -30,7 +30,11 @@ echo "installing dependencies..."
 sudo apt-get install -y \
     pkgconf \
     libavformat-dev libavcodec-dev libavutil-dev libswresample-dev libswscale-dev \
-    libdrm-dev libasound2-dev libcjson-dev libfreetype-dev
+    libdrm-dev libasound2-dev libcjson-dev
+
+# libfreetype-dev was named libfreetype6-dev on older Debian (e.g. Buster);
+# try the current name first, fall back to the old one.
+sudo apt-get install -y libfreetype-dev || sudo apt-get install -y libfreetype6-dev
 
 # Clone and build
 echo "cloning zeroplay${BRANCH:+ ($BRANCH)}..."
