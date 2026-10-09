@@ -20,6 +20,15 @@
 int g_drm_spi_panel = 0;
 int g_spi_fill      = 0;   /* 1 = crop-to-fill instead of the default fit */
 
+/* struct drm_mode_rect doesn't exist in older kernel/libdrm headers (e.g.
+ * Buster) -- it's simple, stable UAPI (four int32 fields), so define our
+ * own identically-shaped struct under a different name rather than
+ * detecting/guarding the system one. Used only as a plain data blob for
+ * drmModeCreatePropertyBlob(), so the name doesn't need to match. */
+struct zp_drm_rect {
+    int32_t x1, y1, x2, y2;
+};
+
 /* ------------------------------------------------------------------ */
 /* Bitmap font — public domain 8x8, chars 0x20-0x7E                   */
 /* Each byte = one row (top→bottom). Bit 0 = leftmost pixel.          */
@@ -1250,7 +1259,7 @@ static int rgb565_present_fit(DrmContext *ctx, DrmOutput *out,
     /* Flush only the image rect once the static bars are painted. */
     uint32_t damage_blob = 0;
     if (!need_modeset && !out->fit_need_full && out->prop_fb_damage_clips) {
-        struct drm_mode_rect rect = {
+        struct zp_drm_rect rect = {
             .x1 = (int32_t)out->fit_dx,
             .y1 = (int32_t)out->fit_dy,
             .x2 = (int32_t)(out->fit_dx + out->fit_dw),
