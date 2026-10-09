@@ -1,5 +1,12 @@
 FROM --platform=linux/arm64 debian:buster
 
+# Buster is EOL -- its packages were pulled from the regular mirrors and
+# only live on archive.debian.org now, which also requires skipping the
+# Release file's Valid-Until check (it's long past that date).
+RUN echo "deb http://archive.debian.org/debian buster main contrib non-free" > /etc/apt/sources.list \
+ && echo "deb http://archive.debian.org/debian-security buster/updates main contrib non-free" >> /etc/apt/sources.list \
+ && echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc make pkgconf libc6-dev \
     libavformat-dev libavcodec-dev libavutil-dev \
@@ -7,7 +14,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libdrm-dev libasound2-dev \
     libfreetype-dev \
     libcjson-dev \
-
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
