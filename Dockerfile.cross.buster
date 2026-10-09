@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libavformat-dev libavcodec-dev libavutil-dev \
     libswresample-dev libswscale-dev \
     libdrm-dev libasound2-dev \
-    libfreetype-dev \
+    libfreetype6-dev \
     libcjson-dev \
  && rm -rf /var/lib/apt/lists/*
 
