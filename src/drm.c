@@ -573,7 +573,13 @@ static void release_gem(int fd, uint32_t gem_handle, int is_dumb)
         struct drm_mode_destroy_dumb dreq = { .handle = gem_handle };
         drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
     } else {
-        drmCloseBufferHandle(fd, gem_handle);
+        /* drmCloseBufferHandle() isn't present in older libdrm (e.g.
+         * Buster) -- it's just a thin wrapper around this ioctl, which
+         * has been stable UAPI for far longer than that function has
+         * existed, so call it directly instead of depending on libdrm's
+         * version to have the convenience wrapper. */
+        struct drm_gem_close req = { .handle = gem_handle };
+        drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &req);
     }
 }
 
