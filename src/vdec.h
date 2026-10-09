@@ -4,9 +4,20 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <linux/videodev2.h>
-#include <libavcodec/bsf.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+/* <libavcodec/bsf.h> was split out of avcodec.h in a later ffmpeg; on
+ * Buster's libavcodec-dev (4.1.11) it doesn't exist as a file at all, but
+ * the AVBSFContext/av_bsf_* declarations we need are already pulled in by
+ * avcodec.h above on that version. Only include it where it actually
+ * exists rather than guessing a version cutoff. */
+#if defined(__has_include)
+#  if __has_include(<libavcodec/bsf.h>)
+#    include <libavcodec/bsf.h>
+#  endif
+#else
+#  include <libavcodec/bsf.h>
+#endif
 #include "queue.h"
 
 #define VDEC_OUTPUT_BUFS  4

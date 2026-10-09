@@ -20,6 +20,26 @@
 int g_drm_spi_panel = 0;
 int g_spi_fill      = 0;   /* 1 = crop-to-fill instead of the default fit */
 
+/* struct drm_mode_rect doesn't exist in older kernel/libdrm headers (e.g.
+ * Buster) -- it's simple, stable UAPI (four int32 fields), so define our
+ * own identically-shaped struct under a different name rather than
+ * detecting/guarding the system one. Used only as a plain data blob for
+ * drmModeCreatePropertyBlob(), so the name doesn't need to match. */
+struct zp_drm_rect {
+    int32_t x1, y1, x2, y2;
+};
+
+/* drmCloseBufferHandle() isn't present in older libdrm (e.g. Buster) --
+ * it's just a thin wrapper around this ioctl, which has been stable UAPI
+ * for far longer than that function has existed, so call it directly
+ * everywhere instead of depending on libdrm's version to have the
+ * convenience wrapper. */
+static void close_gem_handle(int fd, uint32_t gem_handle)
+{
+    struct drm_gem_close req = { .handle = gem_handle };
+    drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &req);
+}
+
 /* ------------------------------------------------------------------ */
 /* Bitmap font — public domain 8x8, chars 0x20-0x7E                   */
 /* Each byte = one row (top→bottom). Bit 0 = leftmost pixel.          */
@@ -573,7 +593,7 @@ static void release_gem(int fd, uint32_t gem_handle, int is_dumb)
         struct drm_mode_destroy_dumb dreq = { .handle = gem_handle };
         drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
     } else {
-        drmCloseBufferHandle(fd, gem_handle);
+        close_gem_handle(fd, gem_handle);
     }
 }
 
@@ -1042,7 +1062,7 @@ static int rgb565_present_crop(DrmContext *ctx, DrmOutput *out,
     if (drmModeAddFB2(ctx->fd, fb_w, frame->height, DRM_FORMAT_RGB565,
                        handles, pitches, offsets, &fb_id, 0) < 0) {
         perror("drm: drmModeAddFB2 (rgb565)");
-        drmCloseBufferHandle(ctx->fd, gem_handle);
+        close_gem_handle(ctx->fd, gem_handle);
         return -1;
     }
 
@@ -1065,7 +1085,7 @@ static int rgb565_present_crop(DrmContext *ctx, DrmOutput *out,
                           need_modeset) < 0) {
         perror("drm: atomic commit (rgb565)");
         drmModeRmFB(ctx->fd, fb_id);
-        drmCloseBufferHandle(ctx->fd, gem_handle);
+        close_gem_handle(ctx->fd, gem_handle);
         return -1;
     }
 
@@ -1244,7 +1264,7 @@ static int rgb565_present_fit(DrmContext *ctx, DrmOutput *out,
     /* Flush only the image rect once the static bars are painted. */
     uint32_t damage_blob = 0;
     if (!need_modeset && !out->fit_need_full && out->prop_fb_damage_clips) {
-        struct drm_mode_rect rect = {
+        struct zp_drm_rect rect = {
             .x1 = (int32_t)out->fit_dx,
             .y1 = (int32_t)out->fit_dy,
             .x2 = (int32_t)(out->fit_dx + out->fit_dw),
@@ -1317,7 +1337,7 @@ int drm_present(DrmContext *ctx, int output_idx, DecodedFrame *frame)
                                          &fb_id, DRM_MODE_FB_MODIFIERS);
     if (ret < 0) {
         perror("drm: drmModeAddFB2WithModifiers");
-        drmCloseBufferHandle(ctx->fd, gem_handle);
+        close_gem_handle(ctx->fd, gem_handle);
         return -1;
     }
 
@@ -1341,7 +1361,7 @@ int drm_present(DrmContext *ctx, int output_idx, DecodedFrame *frame)
     if (ret < 0) {
         perror("drm: atomic commit failed");
         drmModeRmFB(ctx->fd, fb_id);
-        drmCloseBufferHandle(ctx->fd, gem_handle);
+        close_gem_handle(ctx->fd, gem_handle);
         return -1;
     }
 
