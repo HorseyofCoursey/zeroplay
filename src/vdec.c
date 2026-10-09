@@ -332,11 +332,15 @@ int vdec_open(VdecContext *ctx, AVStream *stream,
                 bsf_name = "h264_mp4toannexb";
             break;
         case AV_CODEC_ID_VP8:
-            v4l2_fmt = V4L2_PIX_FMT_VP8;
-            break;
+            fprintf(stderr, "vdec: VP8 is not supported by the bcm2835 hardware "
+                            "decoder (zeroplay is H.264-only; WebM/VP8 files "
+                            "will not play)\n");
+            return -1;
         case AV_CODEC_ID_VP9:
-            v4l2_fmt = V4L2_PIX_FMT_VP9;
-            break;
+            fprintf(stderr, "vdec: VP9 is not supported by the bcm2835 hardware "
+                            "decoder (zeroplay is H.264-only; WebM/VP9 files "
+                            "will not play)\n");
+            return -1;
         case AV_CODEC_ID_HEVC:
             fprintf(stderr, "vdec: HEVC is not supported by the bcm2835 hardware decoder\n");
             return -1;
