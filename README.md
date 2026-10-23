@@ -117,6 +117,7 @@ Each path can be a video file, image, `.txt`/`.m3u` playlist, directory, URL, or
 | `--shuffle` | Randomise playlist order |
 | `--recursive` | Load files from folder recursively |
 | `--no-audio` | Disable audio |
+| `--no-downmixing` | Disable 5.1/7.1 to stereo downmixing (output multi-channel as-is) |
 | `--vol n` | Initial volume, 0–200 (default: 100) |
 | `--pos n` | Start position in seconds |
 | `--audio-device dev` | ALSA device override |

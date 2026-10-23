@@ -52,17 +52,25 @@ static int get_frame_channels(AVFrame *frame)
 #endif
 }
 
-static void set_swr_layout(SwrContext *swr, AVCodecContext *codec_ctx)
+static void set_swr_layout(SwrContext *swr, AVCodecContext *codec_ctx, int no_downmix)
 {
 #if HAVE_CH_LAYOUT
     av_opt_set_chlayout(swr, "in_chlayout",  &codec_ctx->ch_layout, 0);
-    av_opt_set_chlayout(swr, "out_chlayout", &codec_ctx->ch_layout, 0);
+    if (!no_downmix && codec_ctx->ch_layout.nb_channels > 2) {
+        AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+        av_opt_set_chlayout(swr, "out_chlayout", &stereo, 0);
+    } else {
+        av_opt_set_chlayout(swr, "out_chlayout", &codec_ctx->ch_layout, 0);
+    }
 #else
     int64_t layout = codec_ctx->channel_layout
                    ? codec_ctx->channel_layout
                    : av_get_default_channel_layout(codec_ctx->channels);
     av_opt_set_int(swr, "in_channel_layout",  layout, 0);
-    av_opt_set_int(swr, "out_channel_layout", layout, 0);
+    int64_t out_layout = (!no_downmix && codec_ctx->channels > 2)
+                       ? AV_CH_LAYOUT_STEREO
+                       : layout;
+    av_opt_set_int(swr, "out_channel_layout", out_layout, 0);
 #endif
 }
 
@@ -234,13 +242,17 @@ static int audio_reopen_alsa(AudioContext *ctx)
 /* ------------------------------------------------------------------ */
 
 int audio_open(AudioContext *ctx, AVStream *stream,
-               const char *device, Queue *audio_queue)
+               const char *device, Queue *audio_queue,
+               int no_downmix)
 {
     memset(ctx, 0, sizeof(*ctx));
 
+    ctx->no_downmix     = no_downmix;
     ctx->audio_queue    = audio_queue;
     ctx->sample_rate    = stream->codecpar->sample_rate;
     ctx->channels       = get_channels(stream->codecpar);
+    if (!no_downmix && ctx->channels > 2)
+        ctx->channels = 2;
     ctx->time_base      = stream->time_base;
     ctx->frames_written = 0;
     ctx->paused         = 0;
@@ -357,7 +369,7 @@ int audio_open(AudioContext *ctx, AVStream *stream,
         return -1;
     }
 
-    set_swr_layout(ctx->swr_ctx, ctx->codec_ctx);
+    set_swr_layout(ctx->swr_ctx, ctx->codec_ctx, ctx->no_downmix);
     av_opt_set_int       (ctx->swr_ctx, "in_sample_rate",
                           ctx->sample_rate, 0);
     av_opt_set_sample_fmt(ctx->swr_ctx, "in_sample_fmt",
@@ -618,7 +630,7 @@ void audio_run(AudioContext *ctx)
                         ctx->sample_rate, ctx->alsa_rate);
 
                     swr_close(ctx->swr_ctx);
-                    set_swr_layout(ctx->swr_ctx, ctx->codec_ctx);
+                    set_swr_layout(ctx->swr_ctx, ctx->codec_ctx, ctx->no_downmix);
                     av_opt_set_int(ctx->swr_ctx, "in_sample_rate",
                                    detected, 0);
                     av_opt_set_sample_fmt(ctx->swr_ctx, "in_sample_fmt",
