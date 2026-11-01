@@ -47,6 +47,7 @@ typedef struct {
     int         loop;
     int         loop_seamless;
     int         no_audio;
+    int         no_downmix;
     float       vol;
     double      start_pos;
     const char *audio_device;
@@ -80,6 +81,7 @@ static void print_usage(void)
         "  --shuffle               randomise playlist order\n"
         "  --recursive             recurse into subdirectories when loading files from a folder\n"
         "  --no-audio              disable audio\n"
+        "  --no-downmixing         disable surround to stereo downmix (output as-is)\n"
         "  --vol n                 initial volume 0-200 (default 100)\n"
         "  --pos n                 start position in seconds (video only)\n"
         "  --audio-device dev      ALSA device (default: auto-detect)\n"
@@ -131,6 +133,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
         { "shuffle",          no_argument,       NULL, 'r' },
         { "recursive",        no_argument,       NULL, 'R' },
         { "no-audio",         no_argument,       NULL, 'n' },
+        { "no-downmixing",    no_argument,       NULL, 'D' },
         { "vol",              required_argument, NULL, 'v' },
         { "pos",              required_argument, NULL, 'p' },
         { "audio-device",     required_argument, NULL, 'a' },
@@ -156,6 +159,7 @@ static int parse_args(int argc, char *argv[], Options *opt)
             case 'r': opt->shuffle           = 1;            break;
             case 'R': opt->recurse           = 1;            break;
             case 'n': opt->no_audio          = 1;            break;
+            case 'D': opt->no_downmix        = 1;            break;
             case 'v': opt->vol               = atof(optarg); break;
             case 'p': opt->start_pos         = atof(optarg); break;
             case 'a': opt->audio_device      = optarg;       break;
@@ -369,6 +373,7 @@ typedef struct {
 
     int          output_idx;
     int          no_audio;
+    int          no_downmix;
     int          separate_audio;
     int64_t      image_duration_us;
     int64_t      duration_us;
@@ -643,7 +648,8 @@ static int player_open_video(PlayerContext *p, const char *filename,
 
         if (audio_stream && (audio_open(&p->audio, audio_stream,
                                          opt->audio_device,
-                                         &p->audio_queue) == 0)) {
+                                         &p->audio_queue,
+                                         p->no_downmix) == 0)) {
             p->audio.volume = opt->vol / 100.0f;
             p->audio_active = 1;
 
@@ -798,6 +804,7 @@ static int player_open(PlayerContext *p, const char *path,
     memset(p, 0, sizeof(*p));
     p->output_idx        = output_idx;
     p->no_audio          = opt->no_audio || (output_idx != 0);
+    p->no_downmix        = opt->no_downmix;
     p->separate_audio    = 0;
     p->image_duration_us = (int64_t)(opt->image_duration_s * 1000000.0);
     p->drm_ctx           = drm;
@@ -916,6 +923,7 @@ static int run_ws_mode(Options *opt)
     memset(&player, 0, sizeof(player));
     player.output_idx = 0;
     player.no_audio   = opt->no_audio;
+    player.no_downmix = opt->no_downmix;
     player.loop_seamless   = opt->loop_seamless;
 
     int paused = 0;
@@ -1151,6 +1159,7 @@ static int run_control_mode(Options *opt)
     memset(&player, 0, sizeof(player));
     player.output_idx        = 0;
     player.no_audio          = opt->no_audio;
+    player.no_downmix        = opt->no_downmix;
     player.drm_ctx           = &drm;
     player.image_duration_us = (int64_t)(opt->image_duration_s * 1000000.0);
     player.loop_seamless     = opt->loop_seamless;
