@@ -56,8 +56,6 @@ typedef struct {
     int64_t           audio_pts;
     double            video_time_base;
     double            audio_time_base;
-
-    int               no_downmix;
 } AudioContext;
 
 int       audio_open(AudioContext *ctx, AVStream *stream,

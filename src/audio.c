@@ -52,13 +52,23 @@ static int get_frame_channels(AVFrame *frame)
 #endif
 }
 
-static void set_swr_layout(SwrContext *swr, AVCodecContext *codec_ctx, int no_downmix)
+/*
+ * out_channels is the already-resolved final channel count: PR #39's
+ * >2ch-to-stereo downmix decision clamped further by whatever channel
+ * range the ALSA device actually supports (see the probe-and-clamp in
+ * audio_open). Only build a non-identity layout when we're actually
+ * changing the channel count — otherwise keep the source's real layout
+ * (e.g. 5.1 side vs back placement) instead of flattening it to a
+ * generic default that happens to have the same channel count.
+ */
+static void set_swr_layout(SwrContext *swr, AVCodecContext *codec_ctx, int out_channels)
 {
 #if HAVE_CH_LAYOUT
     av_opt_set_chlayout(swr, "in_chlayout",  &codec_ctx->ch_layout, 0);
-    if (!no_downmix && codec_ctx->ch_layout.nb_channels > 2) {
-        AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
-        av_opt_set_chlayout(swr, "out_chlayout", &stereo, 0);
+    if (out_channels != codec_ctx->ch_layout.nb_channels) {
+        AVChannelLayout out_layout;
+        av_channel_layout_default(&out_layout, out_channels);
+        av_opt_set_chlayout(swr, "out_chlayout", &out_layout, 0);
     } else {
         av_opt_set_chlayout(swr, "out_chlayout", &codec_ctx->ch_layout, 0);
     }
@@ -67,8 +77,8 @@ static void set_swr_layout(SwrContext *swr, AVCodecContext *codec_ctx, int no_do
                    ? codec_ctx->channel_layout
                    : av_get_default_channel_layout(codec_ctx->channels);
     av_opt_set_int(swr, "in_channel_layout",  layout, 0);
-    int64_t out_layout = (!no_downmix && codec_ctx->channels > 2)
-                       ? AV_CH_LAYOUT_STEREO
+    int64_t out_layout = (out_channels != codec_ctx->channels)
+                       ? av_get_default_channel_layout(out_channels)
                        : layout;
     av_opt_set_int(swr, "out_channel_layout", out_layout, 0);
 #endif
@@ -84,13 +94,31 @@ static void set_swr_layout(SwrContext *swr, AVCodecContext *codec_ctx, int no_do
 /* ALSA at the rate it actually runs at — no plughw conversion.        */
 /* ------------------------------------------------------------------ */
 
-static int probe_native_rate(const char *dev_name,
-                             unsigned int target, int channels)
+/*
+ * max_channels_out reports the device's real channel ceiling (queried
+ * before anything constrains the config space to a specific count) so
+ * the caller can clamp down when even a stereo downmix doesn't fit —
+ * e.g. a device that only exposes 1 channel. On any probe failure we
+ * leave it at the caller's already-decided channel count, same as the
+ * existing "keep target" fallback for rate.
+ */
+static int probe_native_rate(const char *dev_name, unsigned int target,
+                             int channels, unsigned int *min_channels_out,
+                             unsigned int *max_channels_out)
 {
-    /* Build the raw hw: name from plughw: (or hw: as-is) */
+    *min_channels_out = (unsigned int)channels;
+    *max_channels_out = (unsigned int)channels;
+
+    /* Build the raw hw: name from plughw:/hdmi: (or hw: as-is). 'hdmi:'
+     * is what audio_open's own device auto-detect picks first (it routes
+     * through the plug/iec958 chain) — without this, every HDMI device
+     * fell into the "unknown device type" case below and this probe
+     * never actually queried real hardware at all. */
     char hw_name[64];
     if (strncmp(dev_name, "plughw:", 7) == 0)
         snprintf(hw_name, sizeof(hw_name), "hw:%s", dev_name + 7);
+    else if (strncmp(dev_name, "hdmi:", 5) == 0)
+        snprintf(hw_name, sizeof(hw_name), "hw:%s", dev_name + 5);
     else if (strncmp(dev_name, "hw:", 3) == 0)
         snprintf(hw_name, sizeof(hw_name), "%s", dev_name);
     else
@@ -109,6 +137,17 @@ static int probe_native_rate(const char *dev_name,
 
     snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
     snd_pcm_hw_params_set_format(pcm, params, ALSA_FORMAT);
+
+    /* Query the device's real channel range before constraining the
+     * config space to our own requested count below. Some devices (this
+     * Pi's HDMI/iec958 path, for one) have min == max == 2 — stereo is
+     * the *only* valid count, not just a ceiling. */
+    unsigned int min_ch = (unsigned int)channels, max_ch = (unsigned int)channels;
+    if (snd_pcm_hw_params_get_channels_min(params, &min_ch) == 0)
+        *min_channels_out = min_ch;
+    if (snd_pcm_hw_params_get_channels_max(params, &max_ch) == 0)
+        *max_channels_out = max_ch;
+
     snd_pcm_hw_params_set_channels(pcm, params, (unsigned int)channels);
 
     /* Log supported rate range */
@@ -123,9 +162,10 @@ static int probe_native_rate(const char *dev_name,
 
     snd_pcm_close(pcm);
 
-    fprintf(stderr, "audio: hw probe %s — hw rates %u..%u Hz, "
+    fprintf(stderr, "audio: hw probe %s — hw rates %u..%u Hz, %u..%u ch, "
             "target=%u → nearest=%u\n",
-            hw_name, rate_min, rate_max, target, rate);
+            hw_name, rate_min, rate_max, *min_channels_out,
+            *max_channels_out, target, rate);
 
     return (int)rate;
 }
@@ -160,8 +200,8 @@ static int alsa_setup_device(AudioContext *ctx, const char *dev_name,
         ctx->pcm = NULL;
         return -1;
     }
-    snd_pcm_hw_params_set_channels(ctx->pcm, hw_params,
-                                   (unsigned int)ctx->channels);
+    unsigned int req_ch = (unsigned int)ctx->channels;
+    snd_pcm_hw_params_set_channels_near(ctx->pcm, hw_params, &req_ch);
 
     unsigned int rate = (unsigned int)ctx->alsa_rate;
     snd_pcm_hw_params_set_rate_near(ctx->pcm, hw_params, &rate, 0);
@@ -198,6 +238,23 @@ static int alsa_setup_device(AudioContext *ctx, const char *dev_name,
     snd_pcm_hw_params_get_format(hw_params, &actual_fmt);
     snd_pcm_hw_params_get_channels(hw_params, &actual_ch);
     snd_pcm_hw_params_get_rate(hw_params, &actual_rate, NULL);
+
+    /*
+     * Belt-and-suspenders: audio_open's dev_max_channels probe should
+     * already have clamped ctx->channels to what this device supports,
+     * so this is not expected to fire. But the probe reads a throwaway
+     * hw: handle while this is the real device (potentially via a
+     * plug/iec958 chain), so if they ever disagree, say so loudly
+     * instead of silently writing frames at the wrong channel width.
+     */
+    if (actual_ch != (unsigned int)ctx->channels) {
+        fprintf(stderr,
+            "audio: WARNING — requested %d channel(s) but device '%s' "
+            "only negotiated %u; playback will sound wrong (not silent, "
+            "not an error) unless the source is downmixed to %u ch or a "
+            "device supporting %d ch is used instead\n",
+            ctx->channels, dev_name, actual_ch, actual_ch, ctx->channels);
+    }
 
     vlog("audio: ALSA opened — device=%s rate=%u ch=%u fmt=%s "
             "buffer=%lu period=%lu\n",
@@ -247,7 +304,6 @@ int audio_open(AudioContext *ctx, AVStream *stream,
 {
     memset(ctx, 0, sizeof(*ctx));
 
-    ctx->no_downmix     = no_downmix;
     ctx->audio_queue    = audio_queue;
     ctx->sample_rate    = stream->codecpar->sample_rate;
     ctx->channels       = get_channels(stream->codecpar);
@@ -313,9 +369,32 @@ int audio_open(AudioContext *ctx, AVStream *stream,
     /* ------------------------------------------------------------------ */
     /* 0. Probe hardware native rate so we can bypass plughw resampling    */
     /* ------------------------------------------------------------------ */
+    unsigned int dev_min_channels = (unsigned int)ctx->channels;
+    unsigned int dev_max_channels = (unsigned int)ctx->channels;
     ctx->alsa_rate = probe_native_rate(ctx->device,
                                        (unsigned int)ctx->sample_rate,
-                                       ctx->channels);
+                                       ctx->channels, &dev_min_channels,
+                                       &dev_max_channels);
+
+    /* Fallback: PR #39's downmix already clamps >2ch sources to stereo,
+     * but if that still doesn't fit this device's actual channel range
+     * (e.g. HDMI/iec958 paths that are stereo-only — min == max == 2, so
+     * even a mono source doesn't fit either), clamp into range instead
+     * of silently corrupting playback (see alsa_setup_device's warning
+     * for the case this doesn't catch in advance). */
+    int clamped = ctx->channels;
+    if (dev_max_channels > 0 && (unsigned int)clamped > dev_max_channels)
+        clamped = (int)dev_max_channels;
+    else if ((unsigned int)clamped < dev_min_channels)
+        clamped = (int)dev_min_channels;
+    if (clamped != ctx->channels) {
+        fprintf(stderr,
+            "audio: device '%s' only supports %u..%u channel(s), "
+            "falling back from %d to %d\n",
+            ctx->device, dev_min_channels, dev_max_channels,
+            ctx->channels, clamped);
+        ctx->channels = clamped;
+    }
 
     /* ------------------------------------------------------------------ */
     /* 1. Initialise libavcodec audio decoder                              */
@@ -369,7 +448,7 @@ int audio_open(AudioContext *ctx, AVStream *stream,
         return -1;
     }
 
-    set_swr_layout(ctx->swr_ctx, ctx->codec_ctx, ctx->no_downmix);
+    set_swr_layout(ctx->swr_ctx, ctx->codec_ctx, ctx->channels);
     av_opt_set_int       (ctx->swr_ctx, "in_sample_rate",
                           ctx->sample_rate, 0);
     av_opt_set_sample_fmt(ctx->swr_ctx, "in_sample_fmt",
@@ -630,7 +709,7 @@ void audio_run(AudioContext *ctx)
                         ctx->sample_rate, ctx->alsa_rate);
 
                     swr_close(ctx->swr_ctx);
-                    set_swr_layout(ctx->swr_ctx, ctx->codec_ctx, ctx->no_downmix);
+                    set_swr_layout(ctx->swr_ctx, ctx->codec_ctx, ctx->channels);
                     av_opt_set_int(ctx->swr_ctx, "in_sample_rate",
                                    detected, 0);
                     av_opt_set_sample_fmt(ctx->swr_ctx, "in_sample_fmt",
