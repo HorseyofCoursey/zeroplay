@@ -97,8 +97,8 @@ static void print_usage(void)
         "control mode:\n"
         "  --control               read newline commands on stdin, hold the display\n"
         "                          across clips (no console flash between videos).\n"
-        "                          commands: load <path> | loadloop <path> | pause |\n"
-        "                          resume | seek | stop | quit. emits 'ended' on stdout when\n"
+        "                          commands: load <path> | loadloop <path> | loadp <path> | loadploop <path> | \n"
+        "                          pause | resume | seek | stop | quit. emits 'ended' on stdout when\n"
         "                          a non-looping clip finishes. an optional initial\n"
         "                          path is auto-looped at startup.\n"
         "\n"
@@ -1099,6 +1099,8 @@ static int run_ws_mode(Options *opt)
 /* Commands (newline-terminated, on stdin):                             */
 /*   load <path>      play <path> once; emit "ended" on stdout at EOS    */
 /*   loadloop <path>  play <path>, re-opening it seamlessly at each EOS  */
+/*   loadp <path>      play <path> once; emit "ended" on stdout at EOS - start paused   */
+/*   loadploop <path>  play <path>, re-opening it seamlessly at each EOS - start paused  */
 /*   pause / resume   pause / resume playback                           */
 /*   stop             close the pipeline (holds last frame)             */
 /*   quit             exit cleanly (restores the console)               */
