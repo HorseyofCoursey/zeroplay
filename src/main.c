@@ -97,8 +97,8 @@ static void print_usage(void)
         "control mode:\n"
         "  --control               read newline commands on stdin, hold the display\n"
         "                          across clips (no console flash between videos).\n"
-        "                          commands: load <path> | loadloop <path> | pause |\n"
-        "                          resume | seek | stop | quit. emits 'ended' on stdout when\n"
+        "                          commands: load <path> | loadloop <path> | loadp <path> | loadploop <path> | \n"
+        "                          pause | resume | seek | stop | quit. emits 'ended' on stdout when\n"
         "                          a non-looping clip finishes. an optional initial\n"
         "                          path is auto-looped at startup.\n"
         "\n"
@@ -1099,6 +1099,8 @@ static int run_ws_mode(Options *opt)
 /* Commands (newline-terminated, on stdin):                             */
 /*   load <path>      play <path> once; emit "ended" on stdout at EOS    */
 /*   loadloop <path>  play <path>, re-opening it seamlessly at each EOS  */
+/*   loadp <path>      play <path> once; emit "ended" on stdout at EOS - start paused   */
+/*   loadploop <path>  play <path>, re-opening it seamlessly at each EOS - start paused  */
 /*   pause / resume   pause / resume playback                           */
 /*   stop             close the pipeline (holds last frame)             */
 /*   quit             exit cleanly (restores the console)               */
@@ -1209,13 +1211,15 @@ static int run_control_mode(Options *opt)
             char *arg = strchr(cmd, ' ');
             if (arg) { *arg++ = '\0'; while (*arg == ' ') arg++; }
 
-            if ((strcmp(cmd, "load") == 0 || strcmp(cmd, "loadloop") == 0)
+            if ((strcmp(cmd, "load") == 0 || strcmp(cmd, "loadloop") == 0
+                 || strcmp(cmd, "loadp") == 0 || strcmp(cmd, "loadploop") == 0)
                     && arg && *arg) {
                 PlaylistItemType type = type_from_ext(arg);
-                int loop = (strcmp(cmd, "loadloop") == 0);
+                int loop          = (strcmp(cmd, "loadloop") == 0 || strcmp(cmd, "loadploop") == 0);
+                int start_paused  = (cmd[4] == 'p');
 
                 player_close_pipeline(&player);
-                paused        = 0;
+                paused        = start_paused;
                 audio_started = 0;
 
                 if(type == ITEM_IMAGE){
@@ -1246,8 +1250,9 @@ static int run_control_mode(Options *opt)
 
                         player_threads_start(&player);
                         current_loop = loop;
-                        fprintf(stderr, "zeroplay: %s %s\n",
-                                loop ? "loadloop" : "load", current_path);
+                        fprintf(stderr, "zeroplay: %s%s %s\n",
+                                loop ? "loadloop" : "load",
+                                start_paused ? " paused" : "", current_path);
                     }
                 }
             } else if (strcmp(cmd, "pause") == 0) {
