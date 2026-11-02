@@ -1209,13 +1209,15 @@ static int run_control_mode(Options *opt)
             char *arg = strchr(cmd, ' ');
             if (arg) { *arg++ = '\0'; while (*arg == ' ') arg++; }
 
-            if ((strcmp(cmd, "load") == 0 || strcmp(cmd, "loadloop") == 0)
+            if ((strcmp(cmd, "load") == 0 || strcmp(cmd, "loadloop") == 0
+                 || strcmp(cmd, "loadp") == 0 || strcmp(cmd, "loadploop") == 0)
                     && arg && *arg) {
                 PlaylistItemType type = type_from_ext(arg);
-                int loop = (strcmp(cmd, "loadloop") == 0);
+                int loop          = (strcmp(cmd, "loadloop") == 0 || strcmp(cmd, "loadploop") == 0);
+                int start_paused  = (cmd[4] == 'p');
 
                 player_close_pipeline(&player);
-                paused        = 0;
+                paused        = start_paused;
                 audio_started = 0;
 
                 if(type == ITEM_IMAGE){
@@ -1246,8 +1248,9 @@ static int run_control_mode(Options *opt)
 
                         player_threads_start(&player);
                         current_loop = loop;
-                        fprintf(stderr, "zeroplay: %s %s\n",
-                                loop ? "loadloop" : "load", current_path);
+                        fprintf(stderr, "zeroplay: %s%s %s\n",
+                                loop ? "loadloop" : "load",
+                                start_paused ? " paused" : "", current_path);
                     }
                 }
             } else if (strcmp(cmd, "pause") == 0) {
