@@ -1272,6 +1272,7 @@ static int run_control_mode(Options *opt)
                 osd_visible = 0;
                 osd_text[0] = 0;
                 drm_subtitle_update(&drm, player.output_idx, NULL);
+				player.last_sub_text = NULL;
                 printf("osd_ok\n"); fflush(stdout);
             } else if (strcmp(cmd, "pause") == 0) {
                 if (player.pipeline_open && !paused) {
@@ -1330,6 +1331,7 @@ static int run_control_mode(Options *opt)
             osd_visible = 0;
             osd_text[0] = 0;
             drm_subtitle_update(&drm, player.output_idx, NULL);
+			player.last_sub_text = NULL;
         }
         if (lr < 0) break;  /* stdin closed — controller gone, exit cleanly */
 
