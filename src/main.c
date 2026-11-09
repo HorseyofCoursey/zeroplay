@@ -1164,6 +1164,10 @@ static int run_control_mode(Options *opt)
     player.image_duration_us = (int64_t)(opt->image_duration_s * 1000000.0);
     player.loop_seamless     = opt->loop_seamless;
 
+    /* ExternalPlayer Menu OSD: drawn by the existing DRM subtitle overlay. */
+    char osd_text[1024] = "";
+    int64_t osd_deadline_us = 0;  /* 0 means persistent */
+    int osd_visible = 0;
     int  paused        = 0;
     int  audio_started = 0;
     int  current_loop  = 0;
@@ -1250,6 +1254,35 @@ static int run_control_mode(Options *opt)
                                 loop ? "loadloop" : "load", current_path);
                     }
                 }
+            } else if (strcmp(cmd, "osd") == 0 && arg && *arg) {
+                /* osd <duration_ms> <text>; duration 0 = persistent.
+                 * Use literal \n sequences for multi-line menus. */
+                char *endptr = NULL;
+                long ms = strtol(arg, &endptr, 10);
+                if (endptr == arg || !endptr || *endptr != ' ' || ms < 0 || ms > 3600000) {
+                    fprintf(stderr, "zeroplay: usage osd <0..3600000> <text>\n");
+                } else {
+                    const char *src = endptr + 1;
+                    size_t j = 0;
+                    while (*src && j < sizeof(osd_text) - 1) {
+                        if (src[0] == '\\' && src[1] == 'n') {
+                            osd_text[j++] = '\n'; src += 2;
+                        } else {
+                            osd_text[j++] = *src++;
+                        }
+                    }
+                    osd_text[j] = 0;
+                    drm_subtitle_update(&drm, player.output_idx, osd_text);
+                    osd_visible = 1;
+                    osd_deadline_us = ms ? now_us() + (int64_t)ms * 1000 : 0;
+                    printf("osd_ok\n"); fflush(stdout);
+                }
+            } else if (strcmp(cmd, "osdclear") == 0) {
+                osd_visible = 0;
+                osd_text[0] = 0;
+                drm_subtitle_update(&drm, player.output_idx, NULL);
+				player.last_sub_text = NULL;
+                printf("osd_ok\n"); fflush(stdout);
             } else if (strcmp(cmd, "pause") == 0) {
                 if (player.pipeline_open && !paused) {
                     paused = 1;
@@ -1303,11 +1336,19 @@ static int run_control_mode(Options *opt)
                 g_signal_quit = 1;
             }
         }
+        if (osd_visible && osd_deadline_us && now_us() >= osd_deadline_us) {
+            osd_visible = 0;
+            osd_text[0] = 0;
+            drm_subtitle_update(&drm, player.output_idx, NULL);
+			player.last_sub_text = NULL;
+        }
         if (lr < 0) break;  /* stdin closed — controller gone, exit cleanly */
 
         if (play_image) {
-            if (player.image_end_us == 0)
+            if (player.image_end_us == 0) {
+                sleep_us(50000);  /* Static image: avoid busy-spinning. */
                 continue;
+            }
             if (now_us() < player.image_end_us)
                 continue;
 
@@ -1374,7 +1415,8 @@ static int run_control_mode(Options *opt)
         if (p->sub_active) {
             const char *sub = subtitle_get_active(&p->sub, p->current_pts);
             if (sub != p->last_sub_text) {
-                drm_subtitle_update(&drm, p->output_idx, sub);
+                if (!osd_visible)
+                    drm_subtitle_update(&drm, p->output_idx, sub);
                 p->last_sub_text = sub;
             }
         }
