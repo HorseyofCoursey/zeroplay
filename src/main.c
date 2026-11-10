@@ -771,7 +771,9 @@ static int player_advance_to_next(PlayerContext *p, DrmContext *drm,
         player_close_pipeline(p);
         p->image_mode = 0;
 
-        if (show_image(p, item->path, drm, p->image_duration_us) == 0) {
+        int64_t dur = (item->duration_us >= 0) ? item->duration_us
+                                                : p->image_duration_us;
+        if (show_image(p, item->path, drm, dur) == 0) {
             fprintf(stderr, "zeroplay[%d]: showing '%s'\n",
                     p->output_idx, basename(item->path));
         } else {
@@ -818,7 +820,9 @@ static int player_open(PlayerContext *p, const char *path,
     if (!item) { playlist_close(&p->playlist); return -1; }
 
     if (item->type == ITEM_IMAGE) {
-        if (show_image(p, item->path, drm, p->image_duration_us) < 0){
+        int64_t dur = (item->duration_us >= 0) ? item->duration_us
+                                                : p->image_duration_us;
+        if (show_image(p, item->path, drm, dur) < 0){
             if (player_advance_to_next(p, drm, opt) < 0) {
                 playlist_close(&p->playlist);
                 return -1;
@@ -826,8 +830,7 @@ static int player_open(PlayerContext *p, const char *path,
             return 0;
         }
         fprintf(stderr, "zeroplay[%d]: image '%s' (%.0fs)\n",
-                output_idx, item->path,
-                (double)p->image_duration_us / 1e6);
+                output_idx, item->path, (double)dur / 1e6);
     } else {
         if (player_open_video(p, item->path, item->path_audio, opt) < 0) {
             playlist_close(&p->playlist);
@@ -858,7 +861,9 @@ static void player_go_to_prev(PlayerContext *p, DrmContext *drm,
     if (!item) return;
 
     if (item->type == ITEM_IMAGE) {
-        if (show_image(p, item->path, drm, p->image_duration_us) == 0) {
+        int64_t dur = (item->duration_us >= 0) ? item->duration_us
+                                                : p->image_duration_us;
+        if (show_image(p, item->path, drm, dur) == 0) {
             fprintf(stderr, "zeroplay[%d]: showing '%s'\n",
                     p->output_idx, basename(item->path));
         } else {
