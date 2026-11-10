@@ -188,14 +188,29 @@ zeroplay --pos 5400 movie.mp4
 
 ## Playlist files
 
-A plain `.txt` or `.m3u` file with one path or URL per line. Lines starting with `#` are ignored.
+A plain `.txt` or `.m3u` file with one entry per line. Lines starting with `#` are ignored.
 
 ```
 # My playlist
 /home/pi/media/intro.mp4
-/home/pi/media/photo.jpg
+/home/pi/media/photo.jpg 5
+"/home/pi/media/My Photo.jpg" 2500ms
 https://example.com/stream.m3u8
 ```
+
+Each line is `<path> [duration]`. `duration` is optional and only applies to images
+(videos always play to their natural length): a plain number is seconds, or `<n>ms`
+for milliseconds — e.g. `5` or `2500ms`. Omit it to use the global `--image-duration`
+default.
+
+If a path contains spaces, quote it: `"My Photo.jpg" 5`. Without quotes, a path with
+spaces is only safe when no duration follows it — in that case the whole line is
+taken as the path.
+
+A `.txt`/`.m3u` playlist is also re-read automatically whenever playback loops back
+to the start, if the file changed on disk since it was last loaded — so you can edit
+the playlist live while zeroplay is running and the changes take effect on the next
+loop. Directories and single files are not re-scanned this way.
 
 ---
 
