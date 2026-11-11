@@ -14,7 +14,6 @@ typedef struct {
 
     int64_t          video_rebase;      /* rebase-values for seamless looping if audio duration != video-duration */
     int64_t          audio_rebase;
-    int64_t          audio_rebase_truncated;    /* truncated to audio-packet-duration */
     int64_t          sub_rebase;
 
     Queue           *video_queue;

@@ -227,9 +227,8 @@ int demux_init_seamless(DemuxContext *ctx)
     int audio_frame_ticks = -1;
 
     ctx->video_rebase           = -1;
-    ctx->audio_rebase           = -1;
-    ctx->audio_rebase_truncated = -1;
-    ctx->sub_rebase             = -1;
+    ctx->audio_rebase = -1;
+    ctx->sub_rebase   = -1;
 
     AVRational atb;
     AVRational stb;
@@ -290,12 +289,11 @@ int demux_init_seamless(DemuxContext *ctx)
             }
         }
 
-        /* audio_rebase stays exact (used for the per-loop PTS advance, so
-         * quantising it would drift the two timelines apart a little more on
-         * every loop); audio_rebase_truncated is quantised to a whole number
-         * of frames and used only as the packet-skip/is_loop_end threshold. */
-        ctx->audio_rebase           = (int64_t)(video_loop_sec * atb.den / atb.num);
-        ctx->audio_rebase_truncated = (ctx->audio_rebase / audio_frame_ticks) * audio_frame_ticks;
+        /* Exact, not quantised to a frame multiple: it is the per-loop PTS
+         * advance (quantising would drift audio against video every loop),
+         * and the loop-end packet is found from each packet's own duration in
+         * demux_run(), so the codec frame size is never needed for it. */
+        ctx->audio_rebase = (int64_t)(video_loop_sec * atb.den / atb.num);
     }
 
     if(ctx->subtitle_stream_idx != -1){
@@ -306,10 +304,9 @@ int demux_init_seamless(DemuxContext *ctx)
     /* Every packet is dropped or faded against these, so a silently wrong
      * value costs the whole stream. Log them. */
     vlog("demux: seamless — video %.3fs (rebase %lld), audio %.3fs "
-         "(rebase %lld, truncated %lld, %d ticks/frame)\n",
+         "(rebase %lld, %d ticks/frame)\n",
          video_loop_sec, (long long)ctx->video_rebase,
-         audio_loop_sec, (long long)ctx->audio_rebase,
-         (long long)ctx->audio_rebase_truncated, audio_frame_ticks);
+         audio_loop_sec, (long long)ctx->audio_rebase, audio_frame_ticks);
 
     return 0;
 }
@@ -399,7 +396,7 @@ void demux_run(DemuxContext *ctx)
         } else if (pkt->stream_index == ctx->audio_stream_idx) {
             //seamless loop: skip audio-packets if they exceed video-duration
             //(checked before allocating, so a skipped packet costs nothing)
-            if (ctx->loop_seamless && pkt->pts >= ctx->audio_rebase_truncated + pkt->duration) {
+            if (ctx->loop_seamless && pkt->pts >= ctx->audio_rebase) {
                 av_packet_unref(pkt);
                 continue;
             }
@@ -413,10 +410,15 @@ void demux_run(DemuxContext *ctx)
             audioPkt->is_loop_start = 0;
             audioPkt->is_loop_end = 0;
 
-            if(ctx->loop_seamless && pkt->pts >= ctx->audio_rebase_truncated){
+            /* The packet that reaches the loop boundary is the last one; its
+             * overshoot past the boundary is trimmed in audio.c. Uses the
+             * packet's own duration: the codec frame size is often unknown
+             * here (capped stream probing leaves frame_size 0, so ticks fall
+             * back to 1), and a threshold quantised by it is never reached --
+             * audio_done stays 0 and the EOF check tears the loop down. */
+            if(ctx->loop_seamless && pkt->pts + pkt->duration >= ctx->audio_rebase){
                 audioPkt->is_loop_end = 1;
                 audio_done = 1;
-                //if the audio-stream is trimmed to the exact video-duration then the last frame is most probably not a complete audio-frame
                 audioPkt->last_frame_duration = (pkt->pts + pkt->duration) - ctx->audio_rebase;
             }
 
