@@ -15,6 +15,22 @@
 #define AV_PROFILE_H264_EXTENDED             FF_PROFILE_H264_EXTENDED
 #define AV_PROFILE_H264_HIGH                 FF_PROFILE_H264_HIGH
 #endif
+/* With video kept out of stream probing (see demux_open), the H.264 parser
+ * never fills profile/level. Read them from the avcC header instead: byte 1
+ * is profile_idc, byte 2 the constraint flags, byte 3 level_idc. */
+static void h264_profile_from_avcc(AVCodecParameters *par)
+{
+    const uint8_t *x = par->extradata;
+
+    if (par->codec_id != AV_CODEC_ID_H264 || par->extradata_size < 4 || x[0] != 1)
+        return;
+    if (par->profile < 0)
+        par->profile = (x[1] == 66 && (x[2] & 0x40))
+                     ? AV_PROFILE_H264_CONSTRAINED_BASELINE : x[1];
+    if (par->level <= 0)
+        par->level = x[3];
+}
+
 int demux_open(DemuxContext *ctx, const char *filename,
                Queue *video_queue, Queue *audio_queue,
                int64_t hls_max_bandwidth, int separate_audio)
@@ -59,9 +75,46 @@ int demux_open(DemuxContext *ctx, const char *filename,
     }
     av_dict_free(&opts);
 
+    /* Video is decoded in hardware, so find_stream_info's software decode of
+     * it is wasted work, and costly: ~850 ms on a Pi 3 for a 1080p 15 Mbit/s
+     * MP4 whose audio is interleaved in large chunks, because probing decodes
+     * every video frame it reads on the way to the first audio packet. That
+     * stall freezes the screen on every clip switch. When the container
+     * already supplies the size and decoder config (MP4/MOV/MKV avcC), keep
+     * video out of probing and rewind afterwards -- skipped packets are not
+     * buffered, so without the rewind playback would start mid-GOP. TS/HLS
+     * lack these fields (or can't seek) and are probed as before. */
+    int video_probe_skipped = 0;
+    if (ctx->fmt_ctx->pb && (ctx->fmt_ctx->pb->seekable & AVIO_SEEKABLE_NORMAL)) {
+        for (unsigned int i = 0; i < ctx->fmt_ctx->nb_streams; i++) {
+            AVStream *st = ctx->fmt_ctx->streams[i];
+            if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                st->codecpar->width > 0 && st->codecpar->height > 0 &&
+                st->codecpar->extradata_size > 0) {
+                st->discard = AVDISCARD_ALL;
+                video_probe_skipped = 1;
+            }
+        }
+    }
+
     if (avformat_find_stream_info(ctx->fmt_ctx, NULL) < 0) {
         fprintf(stderr, "demux: could not find stream info\n");
         return -1;
+    }
+
+    if (video_probe_skipped) {
+        for (unsigned int i = 0; i < ctx->fmt_ctx->nb_streams; i++) {
+            AVStream *st = ctx->fmt_ctx->streams[i];
+            if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                st->discard == AVDISCARD_ALL) {
+                st->discard = AVDISCARD_DEFAULT;
+                h264_profile_from_avcc(st->codecpar);
+            }
+        }
+        if (av_seek_frame(ctx->fmt_ctx, -1, 0, AVSEEK_FLAG_BACKWARD) < 0) {
+            fprintf(stderr, "demux: could not rewind after stream probing\n");
+            return -1;
+        }
     }
 
     /* Select streams — prefer H.264 video over HEVC/other codecs that the
@@ -227,9 +280,8 @@ int demux_init_seamless(DemuxContext *ctx)
     int audio_frame_ticks = -1;
 
     ctx->video_rebase           = -1;
-    ctx->audio_rebase           = -1;
-    ctx->audio_rebase_truncated = -1;
-    ctx->sub_rebase             = -1;
+    ctx->audio_rebase = -1;
+    ctx->sub_rebase   = -1;
 
     AVRational atb;
     AVRational stb;
@@ -290,12 +342,11 @@ int demux_init_seamless(DemuxContext *ctx)
             }
         }
 
-        /* audio_rebase stays exact (used for the per-loop PTS advance, so
-         * quantising it would drift the two timelines apart a little more on
-         * every loop); audio_rebase_truncated is quantised to a whole number
-         * of frames and used only as the packet-skip/is_loop_end threshold. */
-        ctx->audio_rebase           = (int64_t)(video_loop_sec * atb.den / atb.num);
-        ctx->audio_rebase_truncated = (ctx->audio_rebase / audio_frame_ticks) * audio_frame_ticks;
+        /* Exact, not quantised to a frame multiple: it is the per-loop PTS
+         * advance (quantising would drift audio against video every loop),
+         * and the loop-end packet is found from each packet's own duration in
+         * demux_run(), so the codec frame size is never needed for it. */
+        ctx->audio_rebase = (int64_t)(video_loop_sec * atb.den / atb.num);
     }
 
     if(ctx->subtitle_stream_idx != -1){
@@ -306,10 +357,9 @@ int demux_init_seamless(DemuxContext *ctx)
     /* Every packet is dropped or faded against these, so a silently wrong
      * value costs the whole stream. Log them. */
     vlog("demux: seamless — video %.3fs (rebase %lld), audio %.3fs "
-         "(rebase %lld, truncated %lld, %d ticks/frame)\n",
+         "(rebase %lld, %d ticks/frame)\n",
          video_loop_sec, (long long)ctx->video_rebase,
-         audio_loop_sec, (long long)ctx->audio_rebase,
-         (long long)ctx->audio_rebase_truncated, audio_frame_ticks);
+         audio_loop_sec, (long long)ctx->audio_rebase, audio_frame_ticks);
 
     return 0;
 }
@@ -399,7 +449,7 @@ void demux_run(DemuxContext *ctx)
         } else if (pkt->stream_index == ctx->audio_stream_idx) {
             //seamless loop: skip audio-packets if they exceed video-duration
             //(checked before allocating, so a skipped packet costs nothing)
-            if (ctx->loop_seamless && pkt->pts >= ctx->audio_rebase_truncated + pkt->duration) {
+            if (ctx->loop_seamless && pkt->pts >= ctx->audio_rebase) {
                 av_packet_unref(pkt);
                 continue;
             }
@@ -413,10 +463,15 @@ void demux_run(DemuxContext *ctx)
             audioPkt->is_loop_start = 0;
             audioPkt->is_loop_end = 0;
 
-            if(ctx->loop_seamless && pkt->pts >= ctx->audio_rebase_truncated){
+            /* The packet that reaches the loop boundary is the last one; its
+             * overshoot past the boundary is trimmed in audio.c. Uses the
+             * packet's own duration: the codec frame size is often unknown
+             * here (capped stream probing leaves frame_size 0, so ticks fall
+             * back to 1), and a threshold quantised by it is never reached --
+             * audio_done stays 0 and the EOF check tears the loop down. */
+            if(ctx->loop_seamless && pkt->pts + pkt->duration >= ctx->audio_rebase){
                 audioPkt->is_loop_end = 1;
                 audio_done = 1;
-                //if the audio-stream is trimmed to the exact video-duration then the last frame is most probably not a complete audio-frame
                 audioPkt->last_frame_duration = (pkt->pts + pkt->duration) - ctx->audio_rebase;
             }
 
