@@ -15,6 +15,22 @@
 #define AV_PROFILE_H264_EXTENDED             FF_PROFILE_H264_EXTENDED
 #define AV_PROFILE_H264_HIGH                 FF_PROFILE_H264_HIGH
 #endif
+/* With video kept out of stream probing (see demux_open), the H.264 parser
+ * never fills profile/level. Read them from the avcC header instead: byte 1
+ * is profile_idc, byte 2 the constraint flags, byte 3 level_idc. */
+static void h264_profile_from_avcc(AVCodecParameters *par)
+{
+    const uint8_t *x = par->extradata;
+
+    if (par->codec_id != AV_CODEC_ID_H264 || par->extradata_size < 4 || x[0] != 1)
+        return;
+    if (par->profile < 0)
+        par->profile = (x[1] == 66 && (x[2] & 0x40))
+                     ? AV_PROFILE_H264_CONSTRAINED_BASELINE : x[1];
+    if (par->level <= 0)
+        par->level = x[3];
+}
+
 int demux_open(DemuxContext *ctx, const char *filename,
                Queue *video_queue, Queue *audio_queue,
                int64_t hls_max_bandwidth, int separate_audio)
@@ -59,9 +75,46 @@ int demux_open(DemuxContext *ctx, const char *filename,
     }
     av_dict_free(&opts);
 
+    /* Video is decoded in hardware, so find_stream_info's software decode of
+     * it is wasted work, and costly: ~850 ms on a Pi 3 for a 1080p 15 Mbit/s
+     * MP4 whose audio is interleaved in large chunks, because probing decodes
+     * every video frame it reads on the way to the first audio packet. That
+     * stall freezes the screen on every clip switch. When the container
+     * already supplies the size and decoder config (MP4/MOV/MKV avcC), keep
+     * video out of probing and rewind afterwards -- skipped packets are not
+     * buffered, so without the rewind playback would start mid-GOP. TS/HLS
+     * lack these fields (or can't seek) and are probed as before. */
+    int video_probe_skipped = 0;
+    if (ctx->fmt_ctx->pb && (ctx->fmt_ctx->pb->seekable & AVIO_SEEKABLE_NORMAL)) {
+        for (unsigned int i = 0; i < ctx->fmt_ctx->nb_streams; i++) {
+            AVStream *st = ctx->fmt_ctx->streams[i];
+            if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                st->codecpar->width > 0 && st->codecpar->height > 0 &&
+                st->codecpar->extradata_size > 0) {
+                st->discard = AVDISCARD_ALL;
+                video_probe_skipped = 1;
+            }
+        }
+    }
+
     if (avformat_find_stream_info(ctx->fmt_ctx, NULL) < 0) {
         fprintf(stderr, "demux: could not find stream info\n");
         return -1;
+    }
+
+    if (video_probe_skipped) {
+        for (unsigned int i = 0; i < ctx->fmt_ctx->nb_streams; i++) {
+            AVStream *st = ctx->fmt_ctx->streams[i];
+            if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                st->discard == AVDISCARD_ALL) {
+                st->discard = AVDISCARD_DEFAULT;
+                h264_profile_from_avcc(st->codecpar);
+            }
+        }
+        if (av_seek_frame(ctx->fmt_ctx, -1, 0, AVSEEK_FLAG_BACKWARD) < 0) {
+            fprintf(stderr, "demux: could not rewind after stream probing\n");
+            return -1;
+        }
     }
 
     /* Select streams — prefer H.264 video over HEVC/other codecs that the
